@@ -6,23 +6,45 @@ import {
   TeamFlags,
 } from "./controllers/v2/types";
 import { AuthCreditUsageChunk } from "./controllers/v1/types";
-import { ExtractorOptions, Document } from "./lib/entities";
+import { ExtractorOptions } from "./lib/entities";
 import { InternalOptions } from "./scraper/scrapeURL";
 import type { CostTracking } from "./lib/cost-tracking";
+import type { BillingMetadata } from "./services/billing/types";
 import { webhookSchema } from "./services/webhook/schema";
+import type { SerializedTraceContext } from "./lib/otel-tracer";
 
-type Mode = "crawl" | "single_urls" | "sitemap" | "kickoff";
+type ScrapeJobCommon = {
+  concurrencyLimited?: boolean;
+  team_id: string;
+  zeroDataRetention: boolean;
+  billing?: BillingMetadata;
+  keylessReserved?: boolean;
+  traceContext?: SerializedTraceContext;
+  skipNuq?: boolean;
+  requestId?: string;
+  monitoring?: {
+    monitorId: string;
+    checkId: string;
+    targetId: string;
+    source: "explicit" | "discovered";
+  };
+};
 
-export { Mode };
+export type ScrapeJobData = ScrapeJobCommon &
+  (
+    | ScrapeJobSingleUrlsUnique
+    | ScrapeJobKickoffUnique
+    | ScrapeJobKickoffSitemapUnique
+  );
 
-export interface WebScraperOptions {
+type ScrapeJobSingleUrlsUnique = {
+  mode: "single_urls";
+
   url: string;
-  mode: Mode;
   crawlerOptions?: any;
   scrapeOptions: BaseScrapeOptions;
   internalOptions?: InternalOptions;
-  team_id: string;
-  origin?: string;
+  origin: string;
   crawl_id?: string;
   sitemapped?: boolean;
   webhook?: z.infer<typeof webhookSchema>;
@@ -38,114 +60,112 @@ export interface WebScraperOptions {
   from_extract?: boolean;
   startTime?: number;
 
-  zeroDataRetention: boolean;
-  sentry?: any;
   is_extract?: boolean;
-  concurrencyLimited?: boolean;
   apiKeyId: number | null;
-}
+
+  logRequestPromise?: Promise<any>;
+};
+
+export type ScrapeJobSingleUrls = ScrapeJobCommon & ScrapeJobSingleUrlsUnique;
+
+type ScrapeJobKickoffUnique = {
+  mode: "kickoff";
+
+  url: string;
+  crawlerOptions?: any;
+  scrapeOptions: BaseScrapeOptions;
+  internalOptions?: InternalOptions;
+  origin: string;
+  integration?: string | null;
+  crawl_id: string;
+  webhook?: z.infer<typeof webhookSchema>;
+  v1: boolean;
+  apiKeyId: number | null;
+};
+
+export type ScrapeJobKickoff = ScrapeJobCommon & ScrapeJobKickoffUnique;
+
+type ScrapeJobKickoffSitemapUnique = {
+  mode: "kickoff_sitemap";
+
+  crawl_id: string;
+  sitemapUrl: string;
+  location?: ScrapeOptions["location"];
+  origin: string;
+  integration?: string | null;
+  webhook?: z.infer<typeof webhookSchema>;
+  v1: boolean;
+  apiKeyId: number | null;
+};
+
+export type ScrapeJobKickoffSitemap = ScrapeJobCommon &
+  ScrapeJobKickoffSitemapUnique;
 
 export interface RunWebScraperParams {
   url: string;
-  mode: Mode;
   scrapeOptions: ScrapeOptions;
   internalOptions?: InternalOptions;
   team_id: string;
   bull_job_id: string;
   priority?: number;
-  is_scrape?: boolean;
   is_crawl?: boolean;
   urlInvisibleInCurrentCrawl?: boolean;
   costTracking: CostTracking;
-}
-
-export interface FirecrawlJob {
-  job_id?: string;
-  success: boolean;
-  message?: string;
-  num_docs: number;
-  docs: any[];
-  time_taken: number;
-  team_id: string;
-  mode: string;
-  url: string;
-  crawlerOptions?: any;
-  scrapeOptions?: any;
-  origin: string;
-  integration?: string | null;
-  num_tokens?: number;
-  retry?: boolean;
-  crawl_id?: string;
-  tokens_billed?: number;
-  sources?: Record<string, string[]>;
-  cost_tracking?: CostTracking;
-  pdf_num_pages?: number;
-  credits_billed?: number | null;
-  change_tracking_tag?: string | null;
-  dr_clean_by?: string | null;
-
-  zeroDataRetention: boolean;
-}
-
-export interface FirecrawlScrapeResponse {
-  statusCode: number;
-  body: {
-    status: string;
-    data: Document;
-  };
-  error?: string;
-}
-
-export interface FirecrawlCrawlResponse {
-  statusCode: number;
-  body: {
-    status: string;
-    jobId: string;
-  };
-  error?: string;
-}
-
-export interface FirecrawlCrawlStatusResponse {
-  statusCode: number;
-  body: {
-    status: string;
-    data: Document[];
-  };
-  error?: string;
 }
 
 export enum RateLimiterMode {
   Crawl = "crawl",
   CrawlStatus = "crawlStatus",
   Scrape = "scrape",
-  ScrapeAgentPreview = "scrapeAgentPreview",
   Preview = "preview",
   Search = "search",
   Map = "map",
   Extract = "extract",
   ExtractStatus = "extractStatus",
   ExtractAgentPreview = "extractAgentPreview",
+  Browser = "browser",
+  BrowserExecute = "browserExecute",
+  BrowserReplay = "browserReplay",
+  Account = "account",
+  SupportAsk = "supportAsk",
+  Research = "research",
+  DeveloperSearch = "developerSearch",
+  GovSearch = "govSearch",
+  Labs = "labs",
+  Exchange = "exchange",
+  ExchangeDiscover = "exchangeDiscover",
+  FreshFeed = "freshFeed",
 }
 
 export type AuthResponse =
   | {
       success: true;
       team_id: string;
+      org_id?: string | null;
       api_key?: string;
       chunk: AuthCreditUsageChunk | null;
+      // The hosted MCP made the call, as verified in supaAuthenticateUser.
+      hostedMcp?: boolean;
     }
   | {
       success: false;
       error: string;
       status: number;
+      // When true, send the agent OAuth-discovery WWW-Authenticate header even on
+      // non-401 responses (e.g. keyless cap 429s) so agents can find the key flow.
+      agentAuthDiscovery?: boolean;
+      // Machine-readable keyless quota details for trusted MCP recovery.
+      keylessReason?: "requests" | "credits";
+      retryAfterSeconds?: number;
+      // Keyless prompts: the signup link in `error`, for clients that relay it.
+      signupUrl?: string;
     };
 
 export enum NotificationType {
-  APPROACHING_LIMIT = "approachingLimit",
-  LIMIT_REACHED = "limitReached",
   RATE_LIMIT_REACHED = "rateLimitReached",
   AUTO_RECHARGE_SUCCESS = "autoRechargeSuccess",
   AUTO_RECHARGE_FAILED = "autoRechargeFailed",
   CONCURRENCY_LIMIT_REACHED = "concurrencyLimitReached",
   AUTO_RECHARGE_FREQUENT = "autoRechargeFrequent",
+  AGENT_SPONSOR_CONFIRM = "agentSponsorConfirm",
 }

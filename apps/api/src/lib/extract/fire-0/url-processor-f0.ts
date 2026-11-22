@@ -14,13 +14,18 @@ import { generateText } from "ai";
 import { getModel } from "../../generic-ai";
 import { CostTracking } from "../../cost-tracking";
 import { getACUCTeam } from "../../../controllers/auth";
+import { aiTelemetry } from "../../ai-telemetry";
 
 export async function generateBasicCompletion_FO(
   prompt: string,
   metadata: { teamId: string; extractId?: string },
+  teamFlags?: TeamFlags | null,
 ) {
   const { text } = await generateText({
-    model: getModel("gpt-4o"),
+    model: getModel("gpt-4o-mini", undefined, {
+      teamFlags,
+      feature: "Extract",
+    }),
     prompt: prompt,
     temperature: 0,
     providerOptions: {
@@ -32,7 +37,7 @@ export async function generateBasicCompletion_FO(
         },
       },
     },
-    experimental_telemetry: {
+    telemetry: aiTelemetry({
       isEnabled: true,
       functionId: "generateBasicCompletion_F0",
       metadata: {
@@ -44,7 +49,7 @@ export async function generateBasicCompletion_FO(
           : {}),
         teamId: metadata.teamId,
       },
-    },
+    }),
   });
   return text;
 }
@@ -53,6 +58,7 @@ interface ProcessUrlOptions {
   prompt?: string;
   schema?: any;
   teamId: string;
+  orgId?: string | null;
   allowExternalLinks?: boolean;
   origin?: string;
   limit?: number;
@@ -77,7 +83,13 @@ export async function processUrl_F0(
   urlTraces.push(trace);
 
   if (!options.url.includes("/*") && !options.allowExternalLinks) {
-    if (!isUrlBlocked(options.url, teamFlags)) {
+    if (
+      !isUrlBlocked(options.url, teamFlags, {
+        team_id: options.teamId,
+        org_id: options.orgId ?? null,
+        origin: options.origin ?? null,
+      })
+    ) {
       trace.usedInCompletion = true;
       return [options.url];
     }
@@ -98,6 +110,7 @@ export async function processUrl_F0(
         await generateBasicCompletion_FO(
           buildRefrasedPrompt(options.prompt, baseUrl),
           { teamId: options.teamId, extractId: options.extractId },
+          teamFlags,
         )
       )
         ?.replace('"', "")
@@ -112,6 +125,7 @@ export async function processUrl_F0(
       url: baseUrl,
       search: searchQuery,
       teamId: options.teamId,
+      orgId: options.orgId ?? null,
       allowExternalLinks: options.allowExternalLinks,
       origin: options.origin,
       limit: options.limit,
@@ -149,6 +163,7 @@ export async function processUrl_F0(
       const retryMapResults = await getMapResults({
         url: baseUrl,
         teamId: options.teamId,
+        orgId: options.orgId ?? null,
         allowExternalLinks: options.allowExternalLinks,
         origin: options.origin,
         limit: options.limit,
@@ -222,6 +237,7 @@ export async function processUrl_F0(
         (await generateBasicCompletion_FO(
           buildPreRerankPrompt(rephrasedPrompt, options.schema, baseUrl),
           { teamId: options.teamId, extractId: options.extractId },
+          teamFlags,
         )) ??
         "Extract the data according to the schema: " +
           JSON.stringify(options.schema, null, 2);
@@ -254,6 +270,7 @@ export async function processUrl_F0(
           functionId: "processUrl_F0",
           extractId: options.extractId,
         },
+        teamFlags,
       },
       new CostTracking(),
     );
@@ -276,6 +293,7 @@ export async function processUrl_F0(
             functionId: "processUrl_F0",
             extractId: options.extractId,
           },
+          teamFlags,
         },
         new CostTracking(),
       );

@@ -1,3 +1,7 @@
+import * as undici from "undici";
+import { getSecureDispatcher } from "../scraper/scrapeURL/engines/utils/safeFetch";
+import { loadMock } from "../scraper/scrapeURL/lib/mock";
+
 export const protocolIncluded = (url: string) => {
   // if :// not in the start of the url assume http (maybe https?)
   // regex checks if :// appears before any .
@@ -188,4 +192,47 @@ export function removeDuplicateUrls(urls: string[]): string[] {
   }
 
   return [...new Set(Array.from(urlMap.values()))];
+}
+
+export async function resolveRedirects(
+  url: string,
+  abort?: AbortSignal,
+  mock?: string,
+): Promise<string> {
+  const targetUrl = protocolIncluded(url) ? url : `http://${url}`;
+
+  if (mock) {
+    const mocked = (await loadMock(mock))?.requests.find(
+      x => x.options.url === targetUrl && x.options.method === "HEAD",
+    );
+    if (mocked) {
+      return mocked.result.url;
+    }
+  }
+
+  const methods = ["HEAD", "GET"] as const;
+  const dispatcher = getSecureDispatcher(false);
+
+  for (const method of methods) {
+    const signal = abort
+      ? AbortSignal.any([abort, AbortSignal.timeout(2000)])
+      : AbortSignal.timeout(2000);
+
+    try {
+      const response = await undici.fetch(targetUrl, {
+        method,
+        redirect: "follow",
+        dispatcher,
+        signal,
+      });
+
+      return response.url;
+    } catch (error) {
+      if (abort?.aborted) {
+        throw error;
+      }
+    }
+  }
+
+  return targetUrl;
 }

@@ -1,13 +1,14 @@
 import {
   Document,
   ExtractRequest,
+  TeamFlags,
   TokenUsage,
   URLTrace,
 } from "../../../controllers/v2/types";
 import { logger as _logger } from "../../logger";
 import { scrapeDocument_F0 } from "./document-scraper-f0";
 import { billTeam } from "../../../services/billing/credit_billing";
-import { logJob } from "../../../services/logging/log_job";
+import { logExtract } from "../../../services/logging/log_job";
 import { spreadSchemas_F0 } from "./helpers/spread-schemas-f0";
 import Ajv from "ajv";
 const ajv = new Ajv();
@@ -15,7 +16,6 @@ import { getErrorContactMessage } from "../../deployment";
 
 import { ExtractStep, updateExtract } from "../extract-redis";
 import { CUSTOM_U_TEAMS } from "../config";
-import { getCachedDocs, saveCachedDocs } from "../helpers/cached-docs";
 import { normalizeUrl } from "../../canonical-url";
 import { search } from "../../../search";
 import { buildRephraseToSerpPrompt_F0 } from "./build-prompts-f0";
@@ -24,7 +24,7 @@ import {
   generateCompletions_F0,
   generateSchemaFromPrompt_F0,
 } from "./llmExtract-f0";
-import { dereferenceSchema_F0 } from "./helpers/dereference-schema-f0";
+import { dereferenceSchema } from "../helpers/dereference-schema";
 import { analyzeSchemaAndPrompt_F0 } from "./completions/analyzeSchemaAndPrompt-f0";
 import { checkShouldExtract_F0 } from "./completions/checkShouldExtract-f0";
 import { batchExtractPromise_F0 } from "./completions/batchExtract-f0";
@@ -35,19 +35,26 @@ import { mixSchemaObjects_F0 } from "./helpers/mix-schema-objs-f0";
 import { singleAnswerCompletion_F0 } from "./completions/singleAnswer-f0";
 import {
   calculateFinalResultCost_F0,
+  estimateCost_F0,
   estimateTotalCost_F0,
 } from "./usage/llm-cost-f0";
 import { SourceTracker_F0 } from "./helpers/source-tracker-f0";
 import { getACUCTeam } from "../../../controllers/auth";
-import { langfuse } from "../../../services/langfuse";
+import { orgIdFromAcuc } from "../../team-org";
+import { resolveThreatProtection } from "../../threat-protection/request";
+import { getModel } from "../../generic-ai";
+import { isUsOnly } from "../../us-only";
+import { getEffectiveSearchForcedKind } from "../../safe-mode";
 
 interface ExtractServiceOptions {
   request: ExtractRequest;
   teamId: string;
-  subId?: string;
   cacheMode?: "load" | "save" | "direct";
   cacheKey?: string;
   apiKeyId: number | null;
+  createdAt?: number;
+  /** The caller's External-Request-Id, carried on the charge for firebill. */
+  externalRequestId?: string | null;
 }
 
 interface ExtractResult {
@@ -61,6 +68,8 @@ interface ExtractResult {
   llmUsage?: number;
   totalUrlsScraped?: number;
   sources?: Record<string, string[]>;
+  tokensBilled?: number;
+  creditsBilled?: number;
 }
 
 type completions = {
@@ -71,11 +80,21 @@ type completions = {
   sources?: string[];
 };
 
+// Throws UsOnlyUnavailableError for a US-only team. Called up front because
+// later model calls fall back quietly on errors, which would hide the refusal
+// behind an empty result.
+export function checkExtractAvailable(teamFlags: TeamFlags | null | undefined) {
+  getModel("gpt-4.1", undefined, { teamFlags, feature: "Extract" });
+}
+
 export async function performExtraction_F0(
   extractId: string,
   options: ExtractServiceOptions,
 ): Promise<ExtractResult> {
-  const { request, teamId, subId, apiKeyId } = options;
+  const { request, teamId, apiKeyId } = options;
+  const createdAt = options.createdAt
+    ? new Date(options.createdAt)
+    : new Date();
   const urlTraces: URLTrace[] = [];
   let docsMap: Map<string, Document> = new Map();
   let singleAnswerCompletions: completions | null = null;
@@ -86,22 +105,27 @@ export async function performExtraction_F0(
   let sources: Record<string, string[]> = {};
 
   const acuc = await getACUCTeam(teamId);
+  const teamFlags = acuc?.flags ?? null;
+  checkExtractAvailable(teamFlags);
+
+  // Threat protection: resolve the effective policy once for this extract
+  // job (org config + the request's threatProtection override, which the
+  // controller already validated). Threaded into every document scrape so
+  // both user-provided and discovered URLs are enforced in the pipeline.
+  const threatProtectionPolicy = (
+    await resolveThreatProtection({
+      teamId,
+      flags: acuc?.flags ?? null,
+      override: request.threatProtection,
+    })
+  ).policy;
 
   const logger = _logger.child({
     module: "extract",
     method: "performExtraction",
+    extractModel: "fire-0",
     extractId,
     teamId,
-  });
-
-  langfuse.trace({
-    id: "extract:" + extractId,
-    name: "performExtraction",
-    metadata: {
-      teamId,
-      extractId,
-      model: "fire-0",
-    },
   });
 
   // If no URLs are provided, generate URLs from the prompt
@@ -112,11 +136,18 @@ export async function performExtraction_F0(
     const rephrasedPrompt = await generateBasicCompletion_FO(
       buildRephraseToSerpPrompt_F0(request.prompt),
       { teamId, extractId },
+      teamFlags,
+    );
+    const searchForcedKind = getEffectiveSearchForcedKind(
+      teamFlags,
+      request.scrapeOptions?.safeMode,
     );
     const searchResults = await search({
       query: rephrasedPrompt.replace('"', "").replace("'", ""),
       logger,
       num_results: 10,
+      usOnly: isUsOnly(acuc?.flags),
+      enterprise: searchForcedKind ? [searchForcedKind] : undefined,
     });
 
     request.urls = searchResults.map(result => result.url) as string[];
@@ -125,23 +156,16 @@ export async function performExtraction_F0(
     logger.error("No search results found", {
       query: request.prompt,
     });
-    logJob({
-      job_id: extractId,
-      success: false,
-      message: "No search results found",
-      num_docs: 1,
-      docs: [],
-      time_taken: (new Date().getTime() - Date.now()) / 1000,
+    await logExtract({
+      id: extractId,
+      request_id: extractId,
+      urls: request.urls || [],
       team_id: teamId,
-      mode: "extract",
-      url: request.urls?.join(", ") || "",
-      scrapeOptions: request,
-      origin: request.origin ?? "api",
-      integration: request.integration,
-      num_tokens: 0,
-      tokens_billed: 0,
-      sources,
-      zeroDataRetention: false, // not supported
+      options: request,
+      model_kind: "fire-0",
+      credits_cost: 0,
+      is_successful: false,
+      error: "No search results found",
     });
     return {
       success: false,
@@ -151,24 +175,6 @@ export async function performExtraction_F0(
   }
 
   const urls = request.urls || ([] as string[]);
-
-  if (
-    request.__experimental_cacheMode == "load" &&
-    request.__experimental_cacheKey &&
-    urls
-  ) {
-    logger.debug("Loading cached docs...");
-    try {
-      const cache = await getCachedDocs(urls, request.__experimental_cacheKey);
-      for (const doc of cache) {
-        if (doc.metadata.url) {
-          docsMap.set(normalizeUrl(doc.metadata.url), doc);
-        }
-      }
-    } catch (error) {
-      logger.error("Error loading cached docs", { error });
-    }
-  }
 
   // Token tracking
   let tokenUsage: TokenUsage[] = [];
@@ -197,6 +203,7 @@ export async function performExtraction_F0(
         url,
         prompt: request.prompt,
         teamId,
+        orgId: acuc?.org_id ?? null,
         allowExternalLinks: request.allowExternalLinks,
         origin: request.origin,
         limit: request.limit,
@@ -233,23 +240,16 @@ export async function performExtraction_F0(
     logger.error("0 links! Bailing.", {
       linkCount: links.length,
     });
-    logJob({
-      job_id: extractId,
-      success: false,
-      message: "No valid URLs found to scrape",
-      num_docs: 1,
-      docs: [],
-      time_taken: (new Date().getTime() - Date.now()) / 1000,
+    await logExtract({
+      id: extractId,
+      request_id: extractId,
+      urls: request.urls || [],
       team_id: teamId,
-      mode: "extract",
-      url: request.urls?.join(", ") || "",
-      scrapeOptions: request,
-      origin: request.origin ?? "api",
-      integration: request.integration,
-      num_tokens: 0,
-      tokens_billed: 0,
-      sources,
-      zeroDataRetention: false, // not supported
+      options: request,
+      credits_cost: 0,
+      is_successful: false,
+      error: "No valid URLs found to scrape",
+      model_kind: "fire-0",
     });
     return {
       success: false,
@@ -275,10 +275,11 @@ export async function performExtraction_F0(
 
   let reqSchema = request.schema;
   if (!reqSchema && request.prompt) {
-    reqSchema = await generateSchemaFromPrompt_F0(request.prompt, {
-      teamId,
-      extractId,
-    });
+    reqSchema = await generateSchemaFromPrompt_F0(
+      request.prompt,
+      { teamId, extractId },
+      teamFlags,
+    );
     logger.debug("Generated request schema.", {
       originalSchema: request.schema,
       schema: reqSchema,
@@ -286,7 +287,7 @@ export async function performExtraction_F0(
   }
 
   if (reqSchema) {
-    reqSchema = await dereferenceSchema_F0(reqSchema);
+    reqSchema = await dereferenceSchema(reqSchema);
   }
 
   logger.debug("Transformed schema.", {
@@ -306,10 +307,13 @@ export async function performExtraction_F0(
     reasoning,
     keyIndicators,
     tokenUsage: schemaAnalysisTokenUsage,
-  } = await analyzeSchemaAndPrompt_F0(links, reqSchema, request.prompt ?? "", {
-    teamId,
-    extractId,
-  });
+  } = await analyzeSchemaAndPrompt_F0(
+    links,
+    reqSchema,
+    request.prompt ?? "",
+    { teamId, extractId, functionId: "performExtraction_F0" },
+    teamFlags,
+  );
 
   logger.debug("Analyzed schema.", {
     isMultiEntity,
@@ -372,10 +376,13 @@ export async function performExtraction_F0(
           {
             url,
             teamId,
+            orgId: acuc?.org_id ?? null,
             origin: "extract",
             timeout,
             flags: acuc?.flags ?? null,
             apiKeyId,
+            requestId: extractId,
+            threatProtectionPolicy,
           },
           urlTraces,
           logger.child({
@@ -445,8 +452,9 @@ export async function performExtraction_F0(
           ajv.compile(multiEntitySchema);
 
           // Wrap in timeout promise
+          let timeoutHandle: NodeJS.Timeout;
           const timeoutPromise = new Promise(resolve => {
-            setTimeout(() => resolve(null), timeoutCompletion);
+            timeoutHandle = setTimeout(() => resolve(null), timeoutCompletion);
           });
 
           // Check if page should be extracted before proceeding
@@ -456,6 +464,7 @@ export async function performExtraction_F0(
               multiEntitySchema,
               doc,
               { teamId, extractId, functionId: "performExtraction_F0" },
+              teamFlags,
             );
 
           tokenUsage.push(shouldExtractCheckTokenUsage);
@@ -504,13 +513,16 @@ export async function performExtraction_F0(
             request.systemPrompt ?? "",
             doc,
             { teamId, extractId, functionId: "performExtraction_F0" },
+            teamFlags,
           );
 
           // Race between timeout and completion
           const multiEntityCompletion = (await Promise.race([
             completionPromise,
             timeoutPromise,
-          ])) as Awaited<ReturnType<typeof generateCompletions_F0>>;
+          ]).finally(() => {
+            clearTimeout(timeoutHandle);
+          })) as Awaited<ReturnType<typeof generateCompletions_F0>>;
 
           // Track multi-entity extraction tokens
           if (multiEntityCompletion) {
@@ -609,23 +621,16 @@ export async function performExtraction_F0(
       Object.assign(sources, multiEntitySources);
     } catch (error) {
       logger.error(`Failed to transform array to object`, { error });
-      logJob({
-        job_id: extractId,
-        success: false,
-        message: "Failed to transform array to object",
-        num_docs: 1,
-        docs: [],
-        time_taken: (new Date().getTime() - Date.now()) / 1000,
+      await logExtract({
+        id: extractId,
+        request_id: extractId,
+        urls: request.urls || [],
         team_id: teamId,
-        mode: "extract",
-        url: request.urls?.join(", ") || "",
-        scrapeOptions: request,
-        origin: request.origin ?? "api",
-        integration: request.integration,
-        num_tokens: 0,
-        tokens_billed: 0,
-        sources,
-        zeroDataRetention: false, // not supported
+        options: request,
+        credits_cost: 0,
+        is_successful: false,
+        error: "Failed to transform array to object",
+        model_kind: "fire-0",
       });
       return {
         success: false,
@@ -670,10 +675,13 @@ export async function performExtraction_F0(
           {
             url,
             teamId,
+            orgId: acuc?.org_id ?? null,
             origin: "extract",
             timeout,
             flags: acuc?.flags ?? null,
             apiKeyId,
+            requestId: extractId,
+            threatProtectionPolicy,
           },
           urlTraces,
           logger.child({
@@ -707,23 +715,16 @@ export async function performExtraction_F0(
       logger.debug("Scrapes finished.", { docCount: validResults.length });
     } catch (error) {
       logger.error("Failed to scrape documents", { error });
-      logJob({
-        job_id: extractId,
-        success: false,
-        message: "Failed to scrape documents",
-        num_docs: 1,
-        docs: [],
-        time_taken: (new Date().getTime() - Date.now()) / 1000,
+      await logExtract({
+        id: extractId,
+        request_id: extractId,
+        urls: request.urls || [],
         team_id: teamId,
-        mode: "extract",
-        url: request.urls?.join(", ") || "",
-        scrapeOptions: request,
-        origin: request.origin ?? "api",
-        integration: request.integration,
-        num_tokens: 0,
-        tokens_billed: 0,
-        sources,
-        zeroDataRetention: false, // not supported
+        options: request,
+        model_kind: "fire-0",
+        credits_cost: 0,
+        is_successful: false,
+        error: "Failed to scrape documents",
       });
       return {
         success: false,
@@ -737,23 +738,16 @@ export async function performExtraction_F0(
     if (docsMap.size == 0) {
       // All urls are invalid
       logger.error("All provided URLs are invalid!");
-      logJob({
-        job_id: extractId,
-        success: false,
-        message: "All provided URLs are invalid",
-        num_docs: 1,
-        docs: [],
-        time_taken: (new Date().getTime() - Date.now()) / 1000,
+      await logExtract({
+        id: extractId,
+        request_id: extractId,
+        urls: request.urls || [],
         team_id: teamId,
-        mode: "extract",
-        url: request.urls?.join(", ") || "",
-        scrapeOptions: request,
-        origin: request.origin ?? "api",
-        integration: request.integration,
-        num_tokens: 0,
-        tokens_billed: 0,
-        sources,
-        zeroDataRetention: false, // not supported
+        options: request,
+        model_kind: "fire-0",
+        credits_cost: 0,
+        is_successful: false,
+        error: "All provided URLs are invalid",
       });
       return {
         success: false,
@@ -790,6 +784,7 @@ export async function performExtraction_F0(
       prompt: request.prompt ?? "",
       systemPrompt: request.systemPrompt ?? "",
       metadata: { teamId, extractId, functionId: "performExtraction_F0" },
+      teamFlags,
     });
     logger.debug("Done generating singleAnswer completions.");
 
@@ -901,60 +896,88 @@ export async function performExtraction_F0(
     tokensToBill = 1;
   }
 
+  const creditsToBill = Math.ceil(tokensToBill / 15);
+
   // Bill team for usage
-  billTeam(teamId, subId, tokensToBill, apiKeyId, logger, true).catch(error => {
+  billTeam(
+    teamId,
+    orgIdFromAcuc(acuc),
+    creditsToBill,
+    apiKeyId,
+    {
+      endpoint: "extract",
+      jobId: extractId,
+      chargeId: extractId,
+      externalRequestId: options.externalRequestId ?? null,
+    },
+    logger,
+  ).catch(error => {
     logger.error(
-      `Failed to bill team ${teamId} for ${tokensToBill} tokens: ${error}`,
+      `Failed to bill team ${teamId} for ${creditsToBill} credits: ${error}`,
     );
   });
 
-  // Log job with token usage and sources
-  logJob({
-    job_id: extractId,
-    success: true,
-    message: "Extract completed",
-    num_docs: 1,
-    docs: finalResult ?? {},
-    time_taken: (new Date().getTime() - Date.now()) / 1000,
-    team_id: teamId,
-    mode: "extract",
-    url: request.urls?.join(", ") || "",
-    scrapeOptions: request,
-    origin: request.origin ?? "api",
-    integration: request.integration,
-    num_tokens: totalTokensUsed,
-    tokens_billed: tokensToBill,
+  logger.debug("Logging extract to database", {
+    extractId,
+    llmUsage,
     sources,
-    zeroDataRetention: false, // not supported
-  }).then(() => {
-    updateExtract(extractId, {
-      status: "completed",
-      llmUsage,
-      sources,
-      tokensBilled: tokensToBill,
-    }).catch(error => {
-      logger.error(
-        `Failed to update extract ${extractId} status to completed: ${error}`,
-      );
-    });
+    tokensBilled: tokensToBill,
+    creditsBilled: creditsToBill,
   });
 
-  logger.debug("Done!");
+  // Log job with token usage and sources
+  await logExtract({
+    id: extractId,
+    request_id: extractId,
+    urls: request.urls || [],
+    team_id: teamId,
+    options: request,
+    model_kind: "fire-0",
+    credits_cost: creditsToBill,
+    is_successful: true,
+    result: finalResult ?? {},
+    cost_tracking: {
+      calls: tokenUsage.map(usage => ({
+        type: "other",
+        cost: estimateCost_F0(usage),
+        model: usage.model ?? "",
+        metadata: {},
+        stack: "",
+        tokens: {
+          input: usage.promptTokens,
+          output: usage.completionTokens,
+        },
+      })),
+      smartScrapeCallCount: 0,
+      smartScrapeCost: 0,
+      otherCallCount: tokenUsage.length,
+      otherCost: llmUsage,
+      totalCost: llmUsage,
+    },
+  })
+    .then(() => {
+      logger.debug("Updating extract status to completed", {
+        extractId,
+        llmUsage,
+        sources,
+        tokensBilled: tokensToBill,
+        creditsBilled: creditsToBill,
+      });
 
-  if (
-    request.__experimental_cacheMode == "save" &&
-    request.__experimental_cacheKey
-  ) {
-    logger.debug("Saving cached docs...");
-    try {
-      await saveCachedDocs(
-        [...docsMap.values()],
-        request.__experimental_cacheKey,
-      );
-    } catch (error) {
-      logger.error("Error saving cached docs", { error });
-    }
-  }
+      // Redis status update moved to worker for consistent ordering
+      logger.debug("Extract completed successfully", {
+        extractId,
+        llmUsage,
+        sources,
+        tokensBilled: tokensToBill,
+        creditsBilled: creditsToBill,
+      });
+    })
+    .catch(error => {
+      logger.error("Failed to log extract to database", { extractId, error });
+    });
+
+  logger.debug("Done!");
 
   return {
     success: true,
@@ -965,5 +988,7 @@ export async function performExtraction_F0(
     llmUsage,
     totalUrlsScraped,
     sources,
+    tokensBilled: tokensToBill,
+    creditsBilled: creditsToBill,
   };
 }

@@ -4,6 +4,7 @@ import { logger } from "../../../lib/logger";
 import { parseMarkdown } from "../../../lib/html-to-markdown";
 import { smartScrape, SmartScrapeResult } from "../lib/smartScrape";
 import { hasFormatOfType } from "../../../lib/format-utils";
+import { isUsOnly } from "../../../lib/us-only";
 
 export async function performAgent(
   meta: Meta,
@@ -13,6 +14,13 @@ export async function performAgent(
     if (meta.internalOptions.zeroDataRetention) {
       document.warning =
         "Agent is not supported with zero data retention." +
+        (document.warning ? " " + document.warning : "");
+      return document;
+    }
+
+    if (isUsOnly(meta.internalOptions.teamFlags ?? undefined)) {
+      document.warning =
+        "Agent is not supported for teams restricted to US-only processing." +
         (document.warning ? " " + document.warning : "");
       return document;
     }
@@ -57,7 +65,12 @@ export async function performAgent(
       ].html;
 
     if (hasFormatOfType(meta.options.formats, "markdown")) {
-      const markdown = await parseMarkdown(html);
+      const requestId = meta.id || meta.internalOptions.crawlId;
+      const markdown = await parseMarkdown(html, {
+        logger: meta.logger,
+        requestId,
+        zeroDataRetention: meta.internalOptions.zeroDataRetention,
+      });
       document.markdown = markdown;
     }
     if (hasFormatOfType(meta.options.formats, "html")) {

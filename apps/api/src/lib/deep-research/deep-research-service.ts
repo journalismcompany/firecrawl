@@ -2,11 +2,13 @@ import { logger as _logger } from "../logger";
 import { updateDeepResearch } from "./deep-research-redis";
 import { searchAndScrapeSearchResult } from "../../controllers/v1/search";
 import { ResearchLLMService, ResearchStateManager } from "./research-manager";
-import { logJob } from "../../services/logging/log_job";
+import { logDeepResearch } from "../../services/logging/log_job";
 import { billTeam } from "../../services/billing/credit_billing";
 import { ExtractOptions } from "../../controllers/v1/types";
 import { CostTracking } from "../cost-tracking";
 import { getACUCTeam } from "../../controllers/auth";
+import { orgIdFromAcuc } from "../team-org";
+import { includesFormat } from "../format-utils";
 export interface DeepResearchServiceOptions {
   researchId: string;
   teamId: string;
@@ -18,13 +20,14 @@ export interface DeepResearchServiceOptions {
   systemPrompt: string;
   formats: string[];
   jsonOptions: ExtractOptions;
-  subId?: string;
   apiKeyId: number | null;
+  /** The caller's External-Request-Id, carried on the charge for firebill. */
+  externalRequestId?: string | null;
 }
 
 export async function performDeepResearch(options: DeepResearchServiceOptions) {
   const costTracking = new CostTracking();
-  const { researchId, teamId, timeLimit, subId, maxUrls, apiKeyId } = options;
+  const { researchId, teamId, timeLimit, maxUrls, apiKeyId } = options;
   const startTime = Date.now();
   let currentTopic = options.query;
   let urlsAnalyzed = 0;
@@ -44,8 +47,6 @@ export async function performDeepResearch(options: DeepResearchServiceOptions) {
     logger,
     options.query,
   );
-  const llmService = new ResearchLLMService(logger);
-
   const acuc = await getACUCTeam(teamId);
 
   const checkTimeLimit = () => {
@@ -61,6 +62,7 @@ export async function performDeepResearch(options: DeepResearchServiceOptions) {
   };
 
   try {
+    const llmService = new ResearchLLMService(logger, acuc?.flags);
     while (!state.hasReachedMaxDepth() && urlsAnalyzed < maxUrls) {
       logger.debug("[Deep Research] Current depth:", state.getCurrentDepth());
       logger.debug("[Deep Research] URL analysis count:", {
@@ -133,6 +135,7 @@ export async function performDeepResearch(options: DeepResearchServiceOptions) {
           searchQuery.query,
           {
             teamId: options.teamId,
+            orgId: acuc?.org_id ?? null,
             origin: "deep-research",
             timeout: 10000,
             scrapeOptions: {
@@ -151,6 +154,7 @@ export async function performDeepResearch(options: DeepResearchServiceOptions) {
               proxy: "basic",
             },
             apiKeyId: apiKeyId,
+            requestId: researchId,
           },
           logger,
           acuc?.flags ?? null,
@@ -354,7 +358,7 @@ export async function performDeepResearch(options: DeepResearchServiceOptions) {
 
     let finalAnalysis = "";
     let finalAnalysisJson = null;
-    if (options.formats.includes("json")) {
+    if (includesFormat(options.formats, "json")) {
       finalAnalysisJson = await llmService.generateFinalAnalysis(
         options.query,
         state.getFindings(),
@@ -370,7 +374,7 @@ export async function performDeepResearch(options: DeepResearchServiceOptions) {
         options.jsonOptions,
       );
     }
-    if (options.formats.includes("markdown")) {
+    if (includesFormat(options.formats, "markdown")) {
       finalAnalysis = await llmService.generateFinalAnalysis(
         options.query,
         state.getFindings(),
@@ -402,29 +406,20 @@ export async function performDeepResearch(options: DeepResearchServiceOptions) {
     const credits_billed = Math.min(urlsAnalyzed, options.maxUrls);
 
     // Log job with token usage and sources
-    await logJob({
-      job_id: researchId,
-      success: true,
-      message: "Research completed",
-      num_docs: 1,
-      docs: [
-        {
-          finalAnalysis: finalAnalysis,
-          sources: state.getSources(),
-          json: finalAnalysisJson,
-        },
-      ],
-      time_taken: (Date.now() - startTime) / 1000,
+    await logDeepResearch({
+      id: researchId,
+      request_id: researchId,
+      query: options.query,
       team_id: teamId,
-      mode: "deep-research",
-      url: options.query,
-      scrapeOptions: options,
-      origin: "api",
-      num_tokens: 0,
-      tokens_billed: 0,
-      cost_tracking: costTracking,
-      credits_billed,
-      zeroDataRetention: false, // not supported
+      options: options,
+      time_taken: (Date.now() - startTime) / 1000,
+      credits_cost: credits_billed,
+      cost_tracking: costTracking.toJSON(),
+      result: {
+        finalAnalysis: finalAnalysis,
+        sources: state.getSources(),
+        json: finalAnalysisJson,
+      },
     });
     await updateDeepResearch(researchId, {
       status: "completed",
@@ -432,7 +427,19 @@ export async function performDeepResearch(options: DeepResearchServiceOptions) {
       json: finalAnalysisJson,
     });
     // Bill team for usage based on URLs analyzed
-    billTeam(teamId, subId, credits_billed, apiKeyId, logger).catch(error => {
+    billTeam(
+      teamId,
+      orgIdFromAcuc(acuc),
+      credits_billed,
+      apiKeyId,
+      {
+        endpoint: "deep_research",
+        jobId: researchId,
+        chargeId: researchId,
+        externalRequestId: options.externalRequestId ?? null,
+      },
+      logger,
+    ).catch(error => {
       logger.error(
         `Failed to bill team ${teamId} for ${urlsAnalyzed} URLs analyzed`,
         { teamId, count: urlsAnalyzed, error },

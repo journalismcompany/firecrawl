@@ -1,3 +1,4 @@
+import { v7 as uuidv7 } from "uuid";
 import {
   Document,
   ScrapeOptions,
@@ -10,16 +11,21 @@ import { addScrapeJob } from "../../../services/queue-jobs";
 import { getJobPriority } from "../../job-priority";
 import type { Logger } from "winston";
 import { isUrlBlocked } from "../../../scraper/WebScraper/utils/blocklist";
-import { scrapeQueue } from "../../../services/worker/nuq";
+import { scrapeQueue } from "../../../services/worker/nuq-router";
+import type { ThreatProtectionPolicy } from "../../threat-protection/types";
 
 interface ScrapeDocumentOptions {
   url: string;
   teamId: string;
+  orgId?: string | null;
   origin: string;
   timeout: number;
   isSingleUrl?: boolean;
   flags: TeamFlags | null;
   apiKeyId: number | null;
+  requestId?: string;
+  /** Effective threat protection policy; enforced in the scrape pipeline. */
+  threatProtectionPolicy?: ThreatProtectionPolicy | null;
 }
 
 export async function scrapeDocument_F0(
@@ -34,16 +40,21 @@ export async function scrapeDocument_F0(
     trace.timing.scrapedAt = new Date().toISOString();
   }
 
-  if (isUrlBlocked(options.url, options.flags ?? null)) {
+  if (
+    isUrlBlocked(options.url, options.flags ?? null, {
+      team_id: options.teamId,
+      org_id: options.orgId ?? null,
+      origin: options.origin,
+    })
+  ) {
     return null;
   }
 
   async function attemptScrape(timeout: number) {
-    const jobId = crypto.randomUUID();
+    const jobId = uuidv7();
     const jobPriority = await getJobPriority({
       team_id: options.teamId,
       basePriority: 10,
-      from_extract: true,
     });
 
     const scrapeOptions = scrapeOptionsSchema.parse({
@@ -59,7 +70,11 @@ export async function scrapeDocument_F0(
         scrapeOptions,
         internalOptions: {
           teamId: options.teamId,
+          orgId: options.orgId ?? null,
           bypassBilling: true,
+          threatProtection: options.threatProtectionPolicy ?? undefined,
+          // Safe Mode resolves per-URL at the scrapeURL backstop from these flags.
+          teamFlags: options.flags ?? undefined,
         },
         origin: options.origin,
         is_scrape: true,
@@ -67,14 +82,17 @@ export async function scrapeDocument_F0(
         startTime: Date.now(),
         zeroDataRetention: false, // not supported
         apiKeyId: options.apiKeyId,
+        requestId: options.requestId,
       },
       jobId,
       jobPriority,
+      false,
+      true,
     );
 
     const doc = await waitForJob(jobId, timeout, false, logger);
     try {
-      await scrapeQueue.removeJob(jobId);
+      await scrapeQueue.removeJob(jobId, logger);
     } catch (error) {
       logger.warn("Error removing job from queue", { error, scrapeId: jobId });
     }

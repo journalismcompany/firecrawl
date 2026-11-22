@@ -1,6 +1,6 @@
+import { config } from "../../../config";
 import {
   ScrapeRequestInput,
-  ScrapeResponse,
   Document,
   ExtractRequestInput,
   ExtractResponse,
@@ -11,30 +11,39 @@ import {
   ErrorResponse,
   CrawlErrorsResponse,
   MapRequestInput,
-  MapResponse,
   BatchScrapeRequestInput,
   SearchRequestInput,
+  SearchFeedbackRequestInput,
+  EndpointFeedbackRequestInput,
+  EndpointFeedbackResponse,
+  ParseRequestInput,
 } from "../../../controllers/v2/types";
 import request from "supertest";
 import {
-  TEST_URL,
+  TEST_API_URL,
   scrapeTimeout,
   indexCooldown,
   Identity,
-  IdmuxRequest,
   idmux,
 } from "../lib";
 import { SearchV2Response } from "../../../lib/entities";
+import { sunsetOf } from "../../../lib/deprecations";
 
 // Re-export shared utilities for backwards compatibility
-export { scrapeTimeout, indexCooldown, Identity, idmux };
+export { scrapeTimeout, indexCooldown, Identity, idmux, TEST_API_URL };
+export default request;
+
+// From the extract sunset /v2/extract answers 410 instead of extracting.
+export const EXTRACT_LIVE = Date.now() < sunsetOf("v2_extract");
+
+const pollSleep = async () => new Promise(r => setTimeout(r, 50));
 
 // =========================================
 // Scrape API
 // =========================================
 
 export async function scrapeRaw(body: ScrapeRequestInput, identity: Identity) {
-  return await request(TEST_URL)
+  return await request(TEST_API_URL)
     .post("/v2/scrape")
     .set("Authorization", `Bearer ${identity.apiKey}`)
     .set("Content-Type", "application/json")
@@ -83,8 +92,217 @@ export async function scrapeWithFailure(
   return raw.body;
 }
 
+// =========================================
+// Monitor API
+// =========================================
+
+export type MonitorCreateInput = {
+  name: string;
+  schedule: { cron: string; timezone?: string };
+  webhook?: { url: string; headers?: Record<string, string> };
+  notification?: {
+    email?: {
+      enabled?: boolean;
+      recipients?: string[];
+      includeDiffs?: boolean;
+    };
+  };
+  targets: Array<
+    | {
+        type: "scrape";
+        urls: string[];
+        scrapeOptions?: Record<string, unknown>;
+      }
+    | {
+        type: "crawl";
+        url: string;
+        crawlOptions?: Record<string, unknown>;
+        scrapeOptions?: Record<string, unknown>;
+      }
+    | {
+        type: "search";
+        queries: string[];
+      }
+  >;
+  retentionDays?: number;
+  goal?: string;
+  judgeEnabled?: boolean;
+  origin?: string;
+};
+
+export async function monitorCreateRaw(
+  body: MonitorCreateInput,
+  identity: Identity,
+) {
+  return await request(TEST_API_URL)
+    .post("/v2/monitor")
+    .set("Authorization", `Bearer ${identity.apiKey}`)
+    .set("Content-Type", "application/json")
+    .send(body);
+}
+
+export async function monitorListRaw(identity: Identity) {
+  return await request(TEST_API_URL)
+    .get("/v2/monitor")
+    .set("Authorization", `Bearer ${identity.apiKey}`);
+}
+
+export async function monitorGetRaw(id: string, identity: Identity) {
+  return await request(TEST_API_URL)
+    .get(`/v2/monitor/${id}`)
+    .set("Authorization", `Bearer ${identity.apiKey}`);
+}
+
+export async function monitorPatchRaw(
+  id: string,
+  body: Partial<MonitorCreateInput> & { status?: "active" | "paused" },
+  identity: Identity,
+) {
+  return await request(TEST_API_URL)
+    .patch(`/v2/monitor/${id}`)
+    .set("Authorization", `Bearer ${identity.apiKey}`)
+    .set("Content-Type", "application/json")
+    .send(body);
+}
+
+export async function monitorDeleteRaw(id: string, identity: Identity) {
+  return await request(TEST_API_URL)
+    .delete(`/v2/monitor/${id}`)
+    .set("Authorization", `Bearer ${identity.apiKey}`);
+}
+
+export async function monitorRunRaw(id: string, identity: Identity) {
+  return await request(TEST_API_URL)
+    .post(`/v2/monitor/${id}/run`)
+    .set("Authorization", `Bearer ${identity.apiKey}`);
+}
+
+export async function monitorCheckRaw(
+  monitorId: string,
+  checkId: string,
+  identity: Identity,
+  query?: Record<string, string | number>,
+) {
+  const req = request(TEST_API_URL)
+    .get(`/v2/monitor/${monitorId}/checks/${checkId}`)
+    .set("Authorization", `Bearer ${identity.apiKey}`);
+  return query ? req.query(query) : req;
+}
+
+export async function monitorEmailConfirmRaw(token: string) {
+  return await request(TEST_API_URL)
+    .post(`/v2/monitor/email/confirm`)
+    .set("Content-Type", "application/json")
+    .send({ token });
+}
+
+export async function monitorEmailUnsubscribeRaw(token: string) {
+  return await request(TEST_API_URL)
+    .post(`/v2/monitor/email/unsubscribe`)
+    .set("Content-Type", "application/json")
+    .send({ token });
+}
+
+export async function monitorEmailConfirmRawViaQuery(token: string) {
+  return await request(TEST_API_URL)
+    .post(`/v2/monitor/email/confirm`)
+    .query({ token });
+}
+
+export async function parseRaw(
+  body: {
+    options?: Omit<ParseRequestInput, "file">;
+    file: {
+      content: Buffer | string;
+      filename: string;
+      contentType?: string;
+    };
+  },
+  identity: Identity,
+) {
+  const fileContent =
+    typeof body.file.content === "string"
+      ? Buffer.from(body.file.content)
+      : body.file.content;
+
+  const req = request(TEST_API_URL)
+    .post("/v2/parse")
+    .set("Authorization", `Bearer ${identity.apiKey}`)
+    .attach("file", fileContent, {
+      filename: body.file.filename,
+      contentType: body.file.contentType,
+    });
+
+  if (body.options !== undefined) {
+    req.field("options", JSON.stringify(body.options));
+  }
+
+  return await req;
+}
+
+export async function parse(
+  body: {
+    options?: Omit<ParseRequestInput, "file">;
+    file: {
+      content: Buffer | string;
+      filename: string;
+      contentType?: string;
+    };
+  },
+  identity: Identity,
+): Promise<Document> {
+  const raw = await parseRaw(body, identity);
+  expectScrapeToSucceed(raw);
+  return raw.body.data;
+}
+
+export async function parseWithFailure(
+  body: {
+    options?: Omit<ParseRequestInput, "file">;
+    file?: {
+      content: Buffer | string;
+      filename: string;
+      contentType?: string;
+    };
+    rawOptions?: string;
+  },
+  identity: Identity,
+): Promise<{
+  success: false;
+  error: string;
+  code?: string;
+}> {
+  const req = request(TEST_API_URL)
+    .post("/v2/parse")
+    .set("Authorization", `Bearer ${identity.apiKey}`);
+
+  if (body.file) {
+    const fileContent =
+      typeof body.file.content === "string"
+        ? Buffer.from(body.file.content)
+        : body.file.content;
+
+    req.attach("file", fileContent, {
+      filename: body.file.filename,
+      contentType: body.file.contentType,
+    });
+  }
+
+  if (body.rawOptions !== undefined) {
+    req.field("options", body.rawOptions);
+  } else if (body.options !== undefined) {
+    req.field("options", JSON.stringify(body.options));
+  }
+
+  const raw = await req;
+  expect(raw.statusCode).not.toBe(200);
+  expect(raw.body.success).toBe(false);
+  expect(typeof raw.body.error).toBe("string");
+  return raw.body;
+}
+
 export async function scrapeStatusRaw(jobId: string, identity: Identity) {
-  return await request(TEST_URL)
+  return await request(TEST_API_URL)
     .get("/v2/scrape/" + encodeURIComponent(jobId))
     .set("Authorization", `Bearer ${identity.apiKey}`)
     .send();
@@ -103,12 +321,104 @@ export async function scrapeStatus(
   return raw.body.data;
 }
 
+export async function scrapeInteractRaw(
+  jobId: string,
+  body: {
+    code: string;
+    language?: "python" | "node" | "bash";
+    timeout?: number;
+    origin?: string;
+  },
+  identity: Identity,
+) {
+  return await request(TEST_API_URL)
+    .post("/v2/scrape/" + encodeURIComponent(jobId) + "/interact")
+    .set("Authorization", `Bearer ${identity.apiKey}`)
+    .set("Content-Type", "application/json")
+    .send(body);
+}
+
+export async function scrapeStopInteractiveBrowserRaw(
+  jobId: string,
+  identity: Identity,
+) {
+  return await request(TEST_API_URL)
+    .delete("/v2/scrape/" + encodeURIComponent(jobId) + "/interact")
+    .set("Authorization", `Bearer ${identity.apiKey}`)
+    .send();
+}
+
+// =========================================
+// Interact (standalone browser sessions)
+// =========================================
+
+export async function browserCreateRaw(
+  body: {
+    ttl?: number;
+    activityTtl?: number;
+    recordSession?: boolean;
+    streamWebView?: boolean;
+    profile?: { name: string; saveChanges?: boolean };
+    location?: Record<string, unknown>;
+  },
+  identity: Identity,
+) {
+  return await request(TEST_API_URL)
+    .post("/v2/interact")
+    .set("Authorization", `Bearer ${identity.apiKey}`)
+    .set("Content-Type", "application/json")
+    .send(body);
+}
+
+export async function browserExecuteRaw(
+  sessionId: string,
+  body: {
+    code: string;
+    language?: "python" | "node" | "bash";
+    timeout?: number;
+  },
+  identity: Identity,
+) {
+  return await request(TEST_API_URL)
+    .post("/v2/interact/" + encodeURIComponent(sessionId) + "/execute")
+    .set("Authorization", `Bearer ${identity.apiKey}`)
+    .set("Content-Type", "application/json")
+    .send(body);
+}
+
+export async function browserDeleteRaw(sessionId: string, identity: Identity) {
+  return await request(TEST_API_URL)
+    .delete("/v2/interact/" + encodeURIComponent(sessionId))
+    .set("Authorization", `Bearer ${identity.apiKey}`)
+    .send();
+}
+
+export async function browserReplayRaw(sessionId: string, identity: Identity) {
+  return await request(TEST_API_URL)
+    .get("/v2/interact/" + encodeURIComponent(sessionId) + "/replay")
+    .set("Authorization", `Bearer ${identity.apiKey}`)
+    .send();
+}
+
+export async function browserReplayPageRaw(
+  sessionId: string,
+  pageId: string,
+  identity: Identity,
+) {
+  return await request(TEST_API_URL)
+    .get(
+      `/v2/interact/${encodeURIComponent(sessionId)}/replay/${encodeURIComponent(pageId)}`,
+    )
+    .set("Authorization", `Bearer ${identity.apiKey}`)
+    .send();
+}
+
 // =========================================
 // Crawl API
 // =========================================
 
 export async function crawlStart(body: CrawlRequestInput, identity: Identity) {
-  return await request(TEST_URL)
+  return await request(TEST_API_URL)
     .post("/v2/crawl")
     .set("Authorization", `Bearer ${identity.apiKey}`)
     .set("Content-Type", "application/json")
@@ -116,14 +426,14 @@ export async function crawlStart(body: CrawlRequestInput, identity: Identity) {
 }
 
 async function crawlStatus(id: string, identity: Identity) {
-  return await request(TEST_URL)
+  return await request(TEST_API_URL)
     .get("/v2/crawl/" + encodeURIComponent(id))
     .set("Authorization", `Bearer ${identity.apiKey}`)
     .send();
 }
 
 async function crawlOngoingRaw(identity: Identity) {
-  return await request(TEST_URL)
+  return await request(TEST_API_URL)
     .get("/v2/crawl/ongoing")
     .set("Authorization", `Bearer ${identity.apiKey}`)
     .send();
@@ -189,9 +499,10 @@ export async function asyncCrawlWaitForFinish(
   id: string,
   identity: Identity,
 ): Promise<Exclude<CrawlStatusResponse, ErrorResponse>> {
-  let x;
+  let x: Awaited<ReturnType<typeof crawlStatus>> | undefined;
 
   do {
+    if (x) await pollSleep();
     x = await crawlStatus(id, identity);
     expect(x.statusCode).toBe(200);
     expect(typeof x.body.status).toBe("string");
@@ -201,11 +512,11 @@ export async function asyncCrawlWaitForFinish(
   return x.body;
 }
 
-async function crawlErrors(
+export async function crawlErrors(
   id: string,
   identity: Identity,
 ): Promise<Exclude<CrawlErrorsResponse, ErrorResponse>> {
-  const res = await request(TEST_URL)
+  const res = await request(TEST_API_URL)
     .get("/v2/crawl/" + id + "/errors")
     .set("Authorization", `Bearer ${identity.apiKey}`)
     .send();
@@ -224,9 +535,10 @@ export async function crawl(
   const cs = await crawlStart(body, identity);
   expectCrawlStartToSucceed(cs);
 
-  let x;
+  let x: Awaited<ReturnType<typeof crawlStatus>> | undefined;
 
   do {
+    if (x) await pollSleep();
     x = await crawlStatus(cs.body.id, identity);
     expect(x.statusCode).toBe(200);
     expect(typeof x.body.status).toBe("string");
@@ -255,7 +567,7 @@ async function batchScrapeStart(
   body: BatchScrapeRequestInput,
   identity: Identity,
 ) {
-  return await request(TEST_URL)
+  return await request(TEST_API_URL)
     .post("/v2/batch/scrape")
     .set("Authorization", `Bearer ${identity.apiKey}`)
     .set("Content-Type", "application/json")
@@ -263,7 +575,7 @@ async function batchScrapeStart(
 }
 
 async function batchScrapeStatus(id: string, identity: Identity) {
-  return await request(TEST_URL)
+  return await request(TEST_API_URL)
     .get("/v2/batch/scrape/" + encodeURIComponent(id))
     .set("Authorization", `Bearer ${identity.apiKey}`)
     .send();
@@ -312,9 +624,10 @@ export async function batchScrape(
   const bss = await batchScrapeStart(body, identity);
   expectBatchScrapeStartToSucceed(bss);
 
-  let x;
+  let x: Awaited<ReturnType<typeof batchScrapeStatus>> | undefined;
 
   do {
+    if (x) await pollSleep();
     x = await batchScrapeStatus(bss.body.id, identity);
     expect(x.statusCode).toBe(200);
     expect(typeof x.body.status).toBe("string");
@@ -332,7 +645,7 @@ export async function batchScrape(
 // =========================================
 
 export async function map(body: MapRequestInput, identity: Identity) {
-  return await request(TEST_URL)
+  return await request(TEST_API_URL)
     .post("/v2/map")
     .set("Authorization", `Bearer ${identity.apiKey}`)
     .set("Content-Type", "application/json")
@@ -354,8 +667,8 @@ export function expectMapToSucceed(response: Awaited<ReturnType<typeof map>>) {
 // Search API
 // =========================================
 
-async function searchRaw(body: SearchRequestInput, identity: Identity) {
-  return await request(TEST_URL)
+export async function searchRaw(body: SearchRequestInput, identity: Identity) {
+  return await request(TEST_API_URL)
     .post("/v2/search")
     .set("Authorization", `Bearer ${identity.apiKey}`)
     .set("Content-Type", "application/json")
@@ -370,6 +683,12 @@ function expectSearchToSucceed(
   expect(typeof response.body.data).toBe("object");
 }
 
+function expectSearchToFail(response: Awaited<ReturnType<typeof searchRaw>>) {
+  expect(response.statusCode).not.toBe(200);
+  expect(response.body.success).toBe(false);
+  expect(typeof response.body.error).toBe("string");
+}
+
 export async function search(
   body: SearchRequestInput,
   identity: Identity,
@@ -379,6 +698,168 @@ export async function search(
   return raw.body.data;
 }
 
+export async function searchWithFailure(
+  body: SearchRequestInput,
+  identity: Identity,
+): Promise<{
+  success: false;
+  error: string;
+  details?: unknown;
+}> {
+  const raw = await searchRaw(body, identity);
+  expectSearchToFail(raw);
+  return raw.body;
+}
+
+export async function researchRaw(
+  path: string,
+  query: Record<string, string | number | boolean | string[]> | undefined,
+  identity?: Identity,
+  headers?: Record<string, string>,
+) {
+  const req = request(TEST_API_URL)
+    .get(path)
+    .set("Content-Type", "application/json");
+  if (identity) {
+    req.set("Authorization", `Bearer ${identity.apiKey}`);
+  }
+  if (headers) {
+    for (const [key, value] of Object.entries(headers)) {
+      req.set(key, value);
+    }
+  }
+  return query ? req.query(query) : req;
+}
+
+export async function researchPostRaw(
+  path: string,
+  body: Record<string, unknown>,
+  identity?: Identity,
+) {
+  const req = request(TEST_API_URL)
+    .post(path)
+    .set("Content-Type", "application/json");
+  if (identity) {
+    req.set("Authorization", `Bearer ${identity.apiKey}`);
+  }
+  return req.send(body);
+}
+
+export async function searchRawFull(
+  body: SearchRequestInput,
+  identity: Identity,
+) {
+  return await request(TEST_API_URL)
+    .post("/v2/search")
+    .set("Authorization", `Bearer ${identity.apiKey}`)
+    .set("Content-Type", "application/json")
+    .send(body);
+}
+
+export async function searchFeedbackRaw(
+  searchId: string,
+  body: SearchFeedbackRequestInput,
+  identity: Identity,
+) {
+  return await request(TEST_API_URL)
+    .post("/v2/search/" + encodeURIComponent(searchId) + "/feedback")
+    .set("Authorization", `Bearer ${identity.apiKey}`)
+    .set("Content-Type", "application/json")
+    .send(body);
+}
+
+export async function searchFeedback(
+  searchId: string,
+  body: SearchFeedbackRequestInput,
+  identity: Identity,
+): Promise<{
+  success: true;
+  feedbackId: string;
+  creditsRefunded: number;
+  creditsRefundedToday?: number;
+  dailyRefundCap?: number;
+  dailyCapReached?: boolean;
+  alreadySubmitted?: boolean;
+  warning?: string;
+}> {
+  const raw = await searchFeedbackRaw(searchId, body, identity);
+  if (raw.statusCode !== 200) {
+    console.warn(
+      "Search feedback did not succeed",
+      JSON.stringify(raw.body, null, 2),
+    );
+  }
+  expect(raw.statusCode).toBe(200);
+  expect(raw.body.success).toBe(true);
+  expect(typeof raw.body.feedbackId).toBe("string");
+  expect(typeof raw.body.creditsRefunded).toBe("number");
+  return raw.body;
+}
+
+export async function searchFeedbackWithFailure(
+  searchId: string,
+  body: SearchFeedbackRequestInput,
+  identity: Identity,
+): Promise<{
+  success: false;
+  error: string;
+  details?: unknown;
+}> {
+  const raw = await searchFeedbackRaw(searchId, body, identity);
+  expect(raw.statusCode).not.toBe(200);
+  expect(raw.body.success).toBe(false);
+  expect(typeof raw.body.error).toBe("string");
+  return raw.body;
+}
+
+// =========================================
+// Generic Feedback API
+// =========================================
+
+export async function endpointFeedbackRaw(
+  body: EndpointFeedbackRequestInput,
+  identity: Identity,
+) {
+  return await request(TEST_API_URL)
+    .post("/v2/feedback")
+    .set("Authorization", `Bearer ${identity.apiKey}`)
+    .set("Content-Type", "application/json")
+    .send(body);
+}
+
+export async function endpointFeedback(
+  body: EndpointFeedbackRequestInput,
+  identity: Identity,
+): Promise<Exclude<EndpointFeedbackResponse, ErrorResponse>> {
+  const raw = await endpointFeedbackRaw(body, identity);
+  if (raw.statusCode !== 200) {
+    console.warn(
+      "Endpoint feedback did not succeed",
+      JSON.stringify(raw.body, null, 2),
+    );
+  }
+  expect(raw.statusCode).toBe(200);
+  expect(raw.body.success).toBe(true);
+  expect(typeof raw.body.feedbackId).toBe("string");
+  expect(typeof raw.body.creditsRefunded).toBe("number");
+  return raw.body;
+}
+
+export async function endpointFeedbackWithFailure(
+  body: EndpointFeedbackRequestInput,
+  identity: Identity,
+): Promise<{
+  success: false;
+  error: string;
+  details?: unknown;
+}> {
+  const raw = await endpointFeedbackRaw(body, identity);
+  expect(raw.statusCode).not.toBe(200);
+  expect(raw.body.success).toBe(false);
+  expect(typeof raw.body.error).toBe("string");
+  return raw.body;
+}
+
 // =========================================
 // Billing API
 // =========================================
@@ -386,7 +867,7 @@ export async function search(
 export async function creditUsage(
   identity: Identity,
 ): Promise<{ remainingCredits: number }> {
-  const req = await request(TEST_URL)
+  const req = await request(TEST_API_URL)
     .get("/v2/team/credit-usage")
     .set("Authorization", `Bearer ${identity.apiKey}`)
     .set("Content-Type", "application/json");
@@ -398,6 +879,51 @@ export async function creditUsage(
   return req.body.data;
 }
 
+export async function creditUsageHistorical(
+  identity: Identity,
+  options: { byApiKey?: boolean } = {},
+): Promise<{
+  success: boolean;
+  periods: {
+    startDate: string | null;
+    endDate: string | null;
+    apiKey?: string;
+    creditsUsed: number;
+  }[];
+}> {
+  const req = await request(TEST_API_URL)
+    .get("/v2/team/credit-usage/historical")
+    .query(options.byApiKey ? { byApiKey: "true" } : {})
+    .set("Authorization", `Bearer ${identity.apiKey}`)
+    .set("Content-Type", "application/json");
+
+  if (req.status !== 200) {
+    throw req.body;
+  }
+
+  return req.body;
+}
+
+export async function tokenUsageHistorical(identity: Identity): Promise<{
+  success: boolean;
+  periods: {
+    startDate: string | null;
+    endDate: string | null;
+    tokensUsed: number;
+  }[];
+}> {
+  const req = await request(TEST_API_URL)
+    .get("/v2/team/token-usage/historical")
+    .set("Authorization", `Bearer ${identity.apiKey}`)
+    .set("Content-Type", "application/json");
+
+  if (req.status !== 200) {
+    throw req.body;
+  }
+
+  return req.body;
+}
+
 // =========================================
 // Concurrency API
 // =========================================
@@ -405,7 +931,7 @@ export async function creditUsage(
 async function concurrencyCheck(
   identity: Identity,
 ): Promise<{ concurrency: number; maxConcurrency: number }> {
-  const x = await request(TEST_URL)
+  const x = await request(TEST_API_URL)
     .get("/v2/team/queue-status")
     .set("Authorization", `Bearer ${identity.apiKey}`)
     .set("Content-Type", "application/json");
@@ -432,6 +958,7 @@ export async function crawlWithConcurrencyTracking(
     concurrencies: number[] = [];
 
   do {
+    if (x) await pollSleep();
     x = await crawlStatus(cs.body.id, identity);
     expect(x.statusCode).toBe(200);
     expect(typeof x.body.status).toBe("string");
@@ -459,6 +986,7 @@ export async function batchScrapeWithConcurrencyTracking(
     concurrencies: number[] = [];
 
   do {
+    if (x) await pollSleep();
     x = await batchScrapeStatus(cs.body.id, identity);
     expect(x.statusCode).toBe(200);
     expect(typeof x.body.status).toBe("string");
@@ -473,12 +1001,76 @@ export async function batchScrapeWithConcurrencyTracking(
 }
 
 // =========================================
+// Extract API
+// =========================================
+
+async function extractStart(body: ExtractRequestInput, identity: Identity) {
+  return await request(TEST_API_URL)
+    .post("/v2/extract")
+    .set("Authorization", `Bearer ${identity.apiKey}`)
+    .set("Content-Type", "application/json")
+    .send(body);
+}
+
+async function extractStatus(id: string, identity: Identity) {
+  return await request(TEST_API_URL)
+    .get("/v2/extract/" + encodeURIComponent(id))
+    .set("Authorization", `Bearer ${identity.apiKey}`)
+    .send();
+}
+
+function expectExtractStartToSucceed(
+  response: Awaited<ReturnType<typeof extractStart>>,
+) {
+  expect(response.statusCode).toBe(200);
+  expect(response.body.success).toBe(true);
+  expect(typeof response.body.id).toBe("string");
+}
+
+function expectExtractToSucceed(
+  response: Awaited<ReturnType<typeof extractStatus>>,
+) {
+  expect(response.statusCode).toBe(200);
+  expect(response.body.success).toBe(true);
+  expect(typeof response.body.status).toBe("string");
+  expect(response.body.status).toBe("completed");
+  expect(response.body).toHaveProperty("data");
+}
+
+export async function extract(
+  body: ExtractRequestInput,
+  identity: Identity,
+): Promise<ExtractResponse> {
+  const es = await extractStart(body, identity);
+  expectExtractStartToSucceed(es);
+
+  let x: Awaited<ReturnType<typeof extractStatus>> | undefined;
+
+  do {
+    if (x) await pollSleep();
+    x = await extractStatus(es.body.id, identity);
+    expect(x.statusCode).toBe(200);
+    expect(typeof x.body.status).toBe("string");
+  } while (x.body.status === "processing");
+
+  expectExtractToSucceed(x);
+  return x.body;
+}
+
+export async function extractRaw(
+  body: ExtractRequestInput,
+  identity: Identity,
+) {
+  return await extractStart(body, identity);
+}
+
+// =========================================
 // ZDR API
 // =========================================
 
 export async function zdrcleaner(teamId: string) {
-  const res = await request(TEST_URL)
-    .get(`/admin/${process.env.BULL_AUTH_KEY}/zdrcleaner`)
+  const res = await request(TEST_API_URL)
+    .get(`/admin/${config.BULL_AUTH_KEY}/zdrcleaner`)
     .query({ teamId });
 
   expect(res.statusCode).toBe(200);

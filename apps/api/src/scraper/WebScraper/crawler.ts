@@ -1,9 +1,9 @@
 import { AxiosError } from "axios";
+import { config } from "../../config";
 import { load } from "cheerio"; // rustified
 import { URL } from "url";
 import { getLinksFromSitemap } from "./sitemap";
 import robotsParser, { Robot } from "robots-parser";
-import psl from "psl";
 import { getURLDepth } from "./utils/maxDepthUtils";
 import { logger as _logger } from "../../lib/logger";
 import { redisEvictConnection } from "../../services/redis";
@@ -14,11 +14,22 @@ import {
   isUrlAllowedByRobots,
 } from "../../lib/robots-txt";
 import { ScrapeJobTimeoutError } from "../../lib/error";
-import { Logger } from "winston";
 import { ScrapeOptions } from "../../controllers/v2/types";
-import { filterLinks } from "@mendable/firecrawl-rs";
+import { filterLinks, filterUrl } from "@mendable/firecrawl-rs";
+import { extractBaseDomain } from "../../lib/url-utils";
+import {
+  describeCrawlScope,
+  getCrawlScope,
+  isWithinCrawlScope,
+} from "../../lib/crawl-scope";
+import {
+  extractLinksFromMarkdown,
+  isMarkdownContentType,
+} from "../scrapeURL/lib/extractLinksFromMarkdown";
 
-export const SITEMAP_LIMIT = 100;
+export const SITEMAP_LIMIT = 25;
+const SITEMAP_FETCH_CONCURRENCY = 3;
+const SITEMAP_MAX_AGE = 7 * 24 * 60 * 60 * 1000;
 
 interface FilterResult {
   allowed: boolean;
@@ -26,23 +37,28 @@ interface FilterResult {
   denialReason?: string;
 }
 
-enum DenialReason {
-  DEPTH_LIMIT = "URL exceeds maximum crawl depth",
-  EXCLUDE_PATTERN = "URL matches exclude pattern",
-  INCLUDE_PATTERN = "URL does not match required include pattern",
-  ROBOTS_TXT = "URL blocked by robots.txt",
-  FILE_TYPE = "URL points to a file type that is not crawled",
-  URL_PARSE_ERROR = "URL could not be parsed",
-  BACKWARD_CRAWLING = "URL cannot be crawled unless crawlEntireDomain is set to true",
-  SOCIAL_MEDIA = "URL is a social media or email link",
-  EXTERNAL_LINK = "External URL not allowed",
-  SECTION_LINK = "URL contains section anchor (#)",
+/** @public filterLinks also reads the members by key, which knip cannot see. */
+export enum DenialReason {
+  DEPTH_LIMIT = "This URL exceeds the maximum crawl depth you configured. The URL's depth (number of path segments) is greater than the maxDepth parameter. To crawl this URL, increase the maxDepth value in your crawl request.",
+  EXCLUDE_PATTERN = "This URL's path matches one of the regex patterns you provided in the excludePaths parameter. URLs matching excludePaths are intentionally skipped during crawling. If this URL should be crawled, adjust your excludePaths patterns.",
+  INCLUDE_PATTERN = "This URL's path does not match any of the regex patterns you provided in the includePaths parameter. When includePaths is specified, only URLs matching at least one pattern are crawled. If this URL should be crawled, add a matching pattern to includePaths or remove the includePaths restriction.",
+  ROBOTS_TXT = "This URL is blocked by the website's robots.txt file, which instructs crawlers not to access this page. Firecrawl respects robots.txt by default. To crawl this URL anyway, set ignoreRobotsTxt: true in your crawl request (note: this may violate the website's crawling policies).",
+  FILE_TYPE = "This URL points to a file type that Firecrawl does not crawl (e.g., images, videos, fonts, archives). Firecrawl automatically skips non-document file extensions like .png, .jpg, .mp4, .zip, .css, .js, etc.",
+  URL_PARSE_ERROR = "This URL could not be parsed as a valid URL. The URL may be malformed, contain invalid characters, or use an unsupported format. Please verify the URL is correctly formatted.",
+  BACKWARD_CRAWLING = "This URL is outside the initial URL's path hierarchy, and backward crawling is disabled. By default, Firecrawl only crawls URLs that are 'below' or 'within' the starting URL path. To crawl this URL, either set allowBackwardCrawling: true or set crawlEntireDomain: true to crawl the entire domain.",
+  SOCIAL_MEDIA = "This URL points to a social media platform or is an email link. Firecrawl automatically skips social media links and mailto: links during crawling.",
+  EXTERNAL_LINK = "This URL points to a different domain than the one being crawled, and external links are disabled. By default, Firecrawl only crawls URLs on the same domain as the starting URL. To crawl external links, set allowExternalLinks: true in your crawl request.",
+  SECTION_LINK = "This URL contains a section anchor (#) and points to a specific section of a page rather than a separate page. Firecrawl treats these as duplicates of the base URL and skips them to avoid crawling the same content multiple times.",
+  NON_WEB_PROTOCOL = "This URL uses a non-web protocol (such as mailto:, tel:, ftp:, ssh:, file:, or telnet:) that Firecrawl cannot scrape. Firecrawl only supports HTTP and HTTPS protocols.",
 }
 
 interface FilterLinksResult {
   links: string[];
   denialReasons: Map<string, string>;
+  /** The links robots.txt disallows. */
+  robotsBlocked: string[];
 }
+
 export class WebCrawler {
   private jobId: string;
   private initialUrl: string;
@@ -69,7 +85,12 @@ export class WebCrawler {
   private maxDiscoveryDepth: number | undefined;
   private currentDiscoveryDepth: number;
   private zeroDataRetention: boolean;
+  public readonly usOnly: boolean;
   private location?: ScrapeOptions["location"];
+  private headers?: Record<string, string>;
+  private robotsUserAgent?: string;
+  // Safe Mode lockdown: no outbound discovery to the target (robots/sitemap).
+  private lockdown: boolean = false;
 
   constructor({
     jobId,
@@ -89,7 +110,11 @@ export class WebCrawler {
     maxDiscoveryDepth,
     currentDiscoveryDepth,
     zeroDataRetention,
+    usOnly,
     location,
+    headers,
+    robotsUserAgent,
+    lockdown,
   }: {
     jobId: string;
     initialUrl: string;
@@ -108,7 +133,11 @@ export class WebCrawler {
     maxDiscoveryDepth?: number;
     currentDiscoveryDepth?: number;
     zeroDataRetention?: boolean;
+    usOnly?: boolean;
     location?: ScrapeOptions["location"];
+    headers?: Record<string, string>;
+    robotsUserAgent?: string;
+    lockdown?: boolean;
   }) {
     this.jobId = jobId;
     this.initialUrl = initialUrl;
@@ -129,6 +158,7 @@ export class WebCrawler {
     this.ignoreRobotsTxt = ignoreRobotsTxt ?? false;
     this.regexOnFullURL = regexOnFullURL ?? false;
     this.zeroDataRetention = zeroDataRetention ?? false;
+    this.usOnly = usOnly ?? false;
     this.logger = _logger.child({
       crawlId: this.jobId,
       module: "WebCrawler",
@@ -137,6 +167,14 @@ export class WebCrawler {
     this.maxDiscoveryDepth = maxDiscoveryDepth;
     this.currentDiscoveryDepth = currentDiscoveryDepth ?? 0;
     this.location = location;
+    this.headers = headers;
+    this.robotsUserAgent = robotsUserAgent;
+    this.lockdown = lockdown ?? false;
+  }
+
+  public setBaseUrl(newBase: string): void {
+    this.baseUrl = newBase;
+    this.robotsTxtUrl = new URL("/robots.txt", newBase).href;
   }
 
   public async filterLinks(
@@ -144,23 +182,35 @@ export class WebCrawler {
     limit: number,
     maxDepth: number,
     fromMap: boolean = false,
+    skipRobots: boolean = false,
+    ignoreDiscoveryDepth: boolean = false,
   ): Promise<FilterLinksResult> {
     const denialReasons = new Map<string, string>();
 
-    if (this.currentDiscoveryDepth === this.maxDiscoveryDepth) {
+    if (
+      !ignoreDiscoveryDepth &&
+      this.currentDiscoveryDepth === this.maxDiscoveryDepth
+    ) {
       this.logger.debug("Max discovery depth hit, filtering off all links", {
         currentDiscoveryDepth: this.currentDiscoveryDepth,
         maxDiscoveryDepth: this.maxDiscoveryDepth,
       });
       sitemapLinks.forEach(link => {
-        denialReasons.set(link, "Maximum discovery depth reached");
+        denialReasons.set(
+          link,
+          `This URL was not crawled because the maximum discovery depth (${this.maxDiscoveryDepth}) has been reached. Discovery depth counts how many 'hops' from the starting URL a page is. To crawl more pages, increase the maxDiscoveryDepth value in your crawl request.`,
+        );
       });
-      return { links: [], denialReasons };
+      return { links: [], denialReasons, robotsBlocked: [] };
     }
 
     // If the initial URL is a sitemap.xml, skip filtering
     if (this.initialUrl.endsWith("sitemap.xml") && fromMap) {
-      return { links: sitemapLinks.slice(0, limit), denialReasons };
+      return {
+        links: sitemapLinks.slice(0, limit),
+        denialReasons,
+        robotsBlocked: [],
+      };
     }
 
     try {
@@ -174,16 +224,77 @@ export class WebCrawler {
         excludes: this.excludes,
         includes: this.includes,
         allowBackwardCrawling: this.allowBackwardCrawling,
-        ignoreRobotsTxt: this.ignoreRobotsTxt,
+        ignoreRobotsTxt: this.ignoreRobotsTxt || skipRobots,
         robotsTxt: this.robotsTxt,
+        robotsUserAgent: this.robotsUserAgent,
+        allowExternalContentLinks: this.allowExternalContentLinks,
+        allowSubdomains: this.allowSubdomains,
       });
 
       const fancyDenialReasons = new Map<string, string>();
       Object.entries(res.denialReasons).forEach(([key, value]) => {
-        fancyDenialReasons.set(key, DenialReason[value]);
+        // Generate dynamic context for specific denial reasons
+        let urlPath: string;
+        try {
+          urlPath = new URL(key).pathname;
+        } catch {
+          urlPath = key;
+        }
+        const excincPath = this.regexOnFullURL ? key : urlPath;
+
+        switch (value) {
+          case "DEPTH_LIMIT":
+            const depth = getURLDepth(key);
+            fancyDenialReasons.set(
+              key,
+              `This URL exceeds the maximum crawl depth you configured. The URL's depth is ${depth}, but maxDepth is set to ${maxDepth}. To crawl this URL, increase the maxDepth value in your crawl request.`,
+            );
+            break;
+          case "EXCLUDE_PATTERN":
+            const matchingExclude = this.excludes.find(p => {
+              try {
+                return new RegExp(p).test(excincPath);
+              } catch {
+                return false;
+              }
+            });
+            fancyDenialReasons.set(
+              key,
+              `This URL's path ("${excincPath}") matches the exclude pattern "${matchingExclude ?? "(unknown)"}" you provided in the excludePaths parameter. URLs matching excludePaths are intentionally skipped during crawling. If this URL should be crawled, adjust your excludePaths patterns.`,
+            );
+            break;
+          case "INCLUDE_PATTERN":
+            fancyDenialReasons.set(
+              key,
+              `This URL's path ("${excincPath}") does not match any of the regex patterns you provided in the includePaths parameter: [${this.includes.map(p => `"${p}"`).join(", ")}]. When includePaths is specified, only URLs matching at least one pattern are crawled. If this URL should be crawled, add a matching pattern to includePaths or remove the includePaths restriction.`,
+            );
+            break;
+          case "BACKWARD_CRAWLING":
+            const initialPath = describeCrawlScope(
+              getCrawlScope(this.initialUrl),
+            );
+            fancyDenialReasons.set(
+              key,
+              `This URL's path ("${urlPath}") is outside the initial URL's path hierarchy ("${initialPath}"), and backward crawling is disabled. By default, Firecrawl only crawls URLs that are 'below' or 'within' the starting URL path. To crawl this URL, either set allowBackwardCrawling: true or set crawlEntireDomain: true to crawl the entire domain.`,
+            );
+            break;
+          case "FILE_TYPE":
+            const extension = key.split("?")[0].split(".").pop()?.toLowerCase();
+            fancyDenialReasons.set(
+              key,
+              `This URL points to a file with extension ".${extension}" that Firecrawl does not crawl. Firecrawl automatically skips non-document file extensions like .png, .jpg, .mp4, .zip, .css, .js, etc. to focus on web pages with textual content.`,
+            );
+            break;
+          default:
+            // Use the static enum message for other cases
+            fancyDenialReasons.set(
+              key,
+              DenialReason[value as keyof typeof DenialReason] ?? value,
+            );
+        }
       });
 
-      if (process.env.FIRECRAWL_DEBUG_FILTER_LINKS) {
+      if (config.FIRECRAWL_DEBUG_FILTER_LINKS) {
         for (const link of res.links) {
           this.logger.debug(`${link} OK`);
         }
@@ -196,6 +307,9 @@ export class WebCrawler {
       return {
         links: res.links,
         denialReasons: fancyDenialReasons,
+        robotsBlocked: Object.keys(res.denialReasons).filter(
+          link => res.denialReasons[link] === "ROBOTS_TXT",
+        ),
       };
     } catch (error) {
       this.logger.error("Error filtering links in Rust, falling back to JS", {
@@ -203,6 +317,8 @@ export class WebCrawler {
         method: "filterLinks",
       });
     }
+
+    const scope = getCrawlScope(this.initialUrl);
 
     const filteredLinks = sitemapLinks
       .filter(link => {
@@ -219,14 +335,35 @@ export class WebCrawler {
         }
         const path = url.pathname;
 
+        const urlStr = url.toString();
+        const nonWebProtocols = [
+          "mailto:",
+          "tel:",
+          "telnet:",
+          "ftp:",
+          "ftps:",
+          "ssh:",
+          "file:",
+        ];
+        if (nonWebProtocols.some(protocol => urlStr.startsWith(protocol))) {
+          if (config.FIRECRAWL_DEBUG_FILTER_LINKS) {
+            this.logger.debug(`${link} NON-WEB PROTOCOL FAIL`);
+          }
+          denialReasons.set(link, DenialReason.NON_WEB_PROTOCOL);
+          return false;
+        }
+
         const depth = getURLDepth(url.toString());
 
         // Check if the link exceeds the maximum depth allowed
         if (depth > maxDepth) {
-          if (process.env.FIRECRAWL_DEBUG_FILTER_LINKS) {
+          if (config.FIRECRAWL_DEBUG_FILTER_LINKS) {
             this.logger.debug(`${link} DEPTH FAIL`);
           }
-          denialReasons.set(link, DenialReason.DEPTH_LIMIT);
+          denialReasons.set(
+            link,
+            `This URL exceeds the maximum crawl depth you configured. The URL's depth is ${depth}, but maxDepth is set to ${maxDepth}. To crawl this URL, increase the maxDepth value in your crawl request.`,
+          );
           return false;
         }
 
@@ -234,15 +371,17 @@ export class WebCrawler {
 
         // Check if the link should be excluded
         if (this.excludes.length > 0 && this.excludes[0] !== "") {
-          if (
-            this.excludes.some(excludePattern =>
-              new RegExp(excludePattern).test(excincPath),
-            )
-          ) {
-            if (process.env.FIRECRAWL_DEBUG_FILTER_LINKS) {
+          const matchingPattern = this.excludes.find(excludePattern =>
+            new RegExp(excludePattern).test(excincPath),
+          );
+          if (matchingPattern) {
+            if (config.FIRECRAWL_DEBUG_FILTER_LINKS) {
               this.logger.debug(`${link} EXCLUDE FAIL`);
             }
-            denialReasons.set(link, DenialReason.EXCLUDE_PATTERN);
+            denialReasons.set(
+              link,
+              `This URL's path ("${excincPath}") matches the exclude pattern "${matchingPattern}" you provided in the excludePaths parameter. URLs matching excludePaths are intentionally skipped during crawling. If this URL should be crawled, adjust your excludePaths patterns.`,
+            );
             return false;
           }
         }
@@ -254,10 +393,13 @@ export class WebCrawler {
               new RegExp(includePattern).test(excincPath),
             )
           ) {
-            if (process.env.FIRECRAWL_DEBUG_FILTER_LINKS) {
+            if (config.FIRECRAWL_DEBUG_FILTER_LINKS) {
               this.logger.debug(`${link} INCLUDE FAIL`);
             }
-            denialReasons.set(link, DenialReason.INCLUDE_PATTERN);
+            denialReasons.set(
+              link,
+              `This URL's path ("${excincPath}") does not match any of the regex patterns you provided in the includePaths parameter: [${this.includes.map(p => `"${p}"`).join(", ")}]. When includePaths is specified, only URLs matching at least one pattern are crawled. If this URL should be crawled, add a matching pattern to includePaths or remove the includePaths restriction.`,
+            );
             return false;
           }
         }
@@ -268,7 +410,7 @@ export class WebCrawler {
         try {
           normalizedLink = new URL(link);
         } catch (_) {
-          if (process.env.FIRECRAWL_DEBUG_FILTER_LINKS) {
+          if (config.FIRECRAWL_DEBUG_FILTER_LINKS) {
             this.logger.debug(`${link} URL PARSE FAIL`);
           }
           return false;
@@ -286,31 +428,27 @@ export class WebCrawler {
         // }
 
         if (!this.allowBackwardCrawling) {
-          if (
-            !normalizedLink.pathname.startsWith(normalizedInitialUrl.pathname)
-          ) {
-            if (process.env.FIRECRAWL_DEBUG_FILTER_LINKS) {
+          if (!isWithinCrawlScope(normalizedLink.pathname, scope)) {
+            if (config.FIRECRAWL_DEBUG_FILTER_LINKS) {
               this.logger.debug(
-                `${link} BACKWARDS FAIL ${normalizedLink.pathname} ${normalizedInitialUrl.pathname}`,
+                `${link} BACKWARDS FAIL ${normalizedLink.pathname} ${describeCrawlScope(scope)}`,
               );
             }
-            denialReasons.set(link, DenialReason.BACKWARD_CRAWLING);
+            denialReasons.set(
+              link,
+              `This URL's path ("${normalizedLink.pathname}") is outside the initial URL's path hierarchy ("${describeCrawlScope(scope)}"), and backward crawling is disabled. By default, Firecrawl only crawls URLs that are 'below' or 'within' the starting URL path. To crawl this URL, either set allowBackwardCrawling: true or set crawlEntireDomain: true to crawl the entire domain.`,
+            );
             return false;
           }
         }
 
-        const isAllowed = this.ignoreRobotsTxt
-          ? true
-          : ((this.robots.isAllowed(link, "FireCrawlAgent") ||
-              this.robots.isAllowed(link, "FirecrawlAgent")) ??
-            true);
         // Check if the link is disallowed by robots.txt
-        if (!isAllowed) {
+        if (!skipRobots && !this.isRobotsAllowed(link)) {
           this.logger.debug(`Link disallowed by robots.txt: ${link}`, {
             method: "filterLinks",
             link,
           });
-          if (process.env.FIRECRAWL_DEBUG_FILTER_LINKS) {
+          if (config.FIRECRAWL_DEBUG_FILTER_LINKS) {
             this.logger.debug(`${link} ROBOTS FAIL`);
           }
           denialReasons.set(link, DenialReason.ROBOTS_TXT);
@@ -318,27 +456,42 @@ export class WebCrawler {
         }
 
         if (this.isFile(link)) {
-          if (process.env.FIRECRAWL_DEBUG_FILTER_LINKS) {
+          if (config.FIRECRAWL_DEBUG_FILTER_LINKS) {
             this.logger.debug(`${link} FILE FAIL`);
           }
-          denialReasons.set(link, DenialReason.FILE_TYPE);
+          const extension = link.split("?")[0].split(".").pop()?.toLowerCase();
+          denialReasons.set(
+            link,
+            `This URL points to a file with extension ".${extension}" that Firecrawl does not crawl. Firecrawl automatically skips non-document file extensions like .png, .jpg, .mp4, .zip, .css, .js, etc. to focus on web pages with textual content.`,
+          );
           return false;
         }
 
-        if (process.env.FIRECRAWL_DEBUG_FILTER_LINKS) {
+        if (config.FIRECRAWL_DEBUG_FILTER_LINKS) {
           this.logger.debug(`${link} OK`);
         }
         return true;
       })
       .slice(0, limit);
 
-    return { links: filteredLinks, denialReasons };
+    return {
+      links: filteredLinks,
+      denialReasons,
+      robotsBlocked: [...denialReasons.keys()].filter(
+        link => denialReasons.get(link) === DenialReason.ROBOTS_TXT,
+      ),
+    };
   }
 
   public async getRobotsTxt(
     skipTlsVerification = false,
     abort?: AbortSignal,
   ): Promise<string> {
+    // Lockdown: no outbound fetch to the target. Empty robots => fail-open,
+    // consistent with a failed robots fetch.
+    if (this.lockdown) {
+      return "";
+    }
     try {
       this.logger.debug("Attempting to fetch robots.txt", {
         method: "getRobotsTxt",
@@ -351,6 +504,17 @@ export class WebCrawler {
           url: this.robotsTxtUrl,
           zeroDataRetention: this.zeroDataRetention,
           location: this.location,
+          usOnly: this.usOnly,
+          skipTlsVerification,
+          ...(this.robotsUserAgent
+            ? {
+                headers: {
+                  ...this.headers,
+                  "User-Agent": this.robotsUserAgent,
+                },
+                skipCache: true,
+              }
+            : {}),
         },
         this.jobId,
         this.logger,
@@ -381,13 +545,14 @@ export class WebCrawler {
     const checker = createRobotsChecker(this.initialUrl, txt);
     this.robots = checker.robots;
     this.robotsTxtUrl = checker.robotsTxtUrl;
-    const delay =
-      this.robots.getCrawlDelay("FireCrawlAgent") ||
-      this.robots.getCrawlDelay("FirecrawlAgent");
+    const delay = this.robotsUserAgent
+      ? this.robots.getCrawlDelay(this.robotsUserAgent)
+      : this.robots.getCrawlDelay("FireCrawlAgent") ||
+        this.robots.getCrawlDelay("FirecrawlAgent");
     this.robotsCrawlDelay = delay !== undefined ? delay : null;
 
     const sitemaps = this.robots.getSitemaps();
-    this.logger.debug("Processed robots.txt", {
+    this.logger.debug("Imported robots.txt", {
       method: "importRobotsTxt",
       robotsTxtUrl: this.robotsTxtUrl,
       robotsTxtLength: txt.length,
@@ -408,11 +573,20 @@ export class WebCrawler {
     timeout: number = 120000,
     abort?: AbortSignal,
     mock?: string,
+    maxAge: number = SITEMAP_MAX_AGE,
   ): Promise<number> {
+    // Lockdown: no outbound sitemap discovery to the target (index-only crawl).
+    if (this.lockdown) {
+      this.logger.debug("Skipping sitemap discovery under Safe Mode lockdown", {
+        method: "tryGetSitemap",
+      });
+      return 0;
+    }
     this.logger.debug(`Fetching sitemap links from ${this.initialUrl}`, {
       method: "tryGetSitemap",
     });
     let leftOfLimit = this.limit;
+    let deliveredCount = 0;
 
     const normalizeUrl = (url: string) => {
       url = url.replace(/^https?:\/\//, "").replace(/^www\./, "");
@@ -425,49 +599,61 @@ export class WebCrawler {
     const _urlsHandler = async (urls: string[]) => {
       this.logger.debug("urlsHandler invoked");
       if (fromMap && onlySitemap) {
+        deliveredCount += urls.length;
         return await urlsHandler(urls);
       } else {
         let filteredLinksResult = await this.filterLinks(
-          [...new Set(urls)].filter(
-            x => this.filterURL(x, this.initialUrl).allowed,
-          ),
+          [...new Set(urls)],
           leftOfLimit,
           this.maxCrawledDepth,
+          fromMap,
           fromMap,
         );
         let filteredLinks = filteredLinksResult.links;
         leftOfLimit -= filteredLinks.length;
-        let uniqueURLs: string[] = [];
-        for (const url of filteredLinks) {
-          if (
-            await redisEvictConnection.sadd(
-              "sitemap:" + this.jobId + ":links",
-              normalizeUrl(url),
-            )
-          ) {
-            uniqueURLs.push(url);
-          }
-        }
+        const pipeline = redisEvictConnection.pipeline();
+
+        const normalizedUrls = filteredLinks.map(url => normalizeUrl(url));
+        normalizedUrls.forEach(normalizedUrl => {
+          pipeline.sadd("sitemap:" + this.jobId + ":links", normalizedUrl);
+        });
+
+        const results = await pipeline.exec();
+
+        const uniqueURLs = filteredLinks.filter(
+          (_, index) =>
+            results &&
+            results[index] &&
+            !results[index][0] &&
+            results[index][1] === 1,
+        );
 
         await redisEvictConnection.expire(
           "sitemap:" + this.jobId + ":links",
           3600,
           "NX",
         );
+
         if (uniqueURLs.length > 0) {
+          deliveredCount += uniqueURLs.length;
           return await urlsHandler(uniqueURLs);
         }
       }
     };
 
+    let timeoutHandle: NodeJS.Timeout;
+    const timeoutController = new AbortController();
     const timeoutPromise = new Promise((_, reject) => {
-      setTimeout(() => reject(new Error("Sitemap fetch timeout")), timeout);
+      timeoutHandle = setTimeout(() => {
+        timeoutController.abort();
+        reject(new Error("Sitemap fetch timeout"));
+      }, timeout);
     });
+    const fetchAbort = abort
+      ? AbortSignal.any([abort, timeoutController.signal])
+      : timeoutController.signal;
 
-    // Allow sitemaps to be cached for 48 hours if they are requested from /map
-    // - mogery
-    const maxAge = fromMap && !onlySitemap ? 48 * 60 * 60 * 1000 : 0;
-
+    let count = 0;
     try {
       const robotsSitemaps = this.robots.getSitemaps();
       this.logger.debug("Attempting to fetch sitemap links", {
@@ -478,22 +664,59 @@ export class WebCrawler {
         hasRobotsTxt: this.robotsTxt.length > 0,
       });
 
-      let count = (await Promise.race([
-        Promise.all([
-          this.tryFetchSitemapLinks(
-            this.initialUrl,
-            _urlsHandler,
-            abort,
-            mock,
-            maxAge,
-          ),
-          ...robotsSitemaps.map(x =>
-            this.tryFetchSitemapLinks(x, _urlsHandler, abort, mock, maxAge),
-          ),
-        ]).then(results => results.reduce((a, x) => a + x, 0)),
-        timeoutPromise,
-      ])) as number;
+      // Fetched in batches so children of early sitemap indexes claim
+      // SITEMAP_LIMIT slots before later top-level sitemaps do.
+      const sitemapSources = [this.initialUrl, ...robotsSitemaps];
 
+      const fetchSources = async () => {
+        let linkCount = 0;
+        for (
+          let i = 0;
+          i < sitemapSources.length &&
+          this.sitemapsHit.size < SITEMAP_LIMIT &&
+          !fetchAbort.aborted;
+          i += SITEMAP_FETCH_CONCURRENCY
+        ) {
+          const results = await Promise.all(
+            sitemapSources
+              .slice(i, i + SITEMAP_FETCH_CONCURRENCY)
+              .map(source =>
+                this.tryFetchSitemapLinks(
+                  source,
+                  _urlsHandler,
+                  fetchAbort,
+                  mock,
+                  maxAge,
+                ),
+              ),
+          );
+          linkCount += results.reduce((a, x) => a + x, 0);
+        }
+        return linkCount;
+      };
+
+      count = (await Promise.race([fetchSources(), timeoutPromise]).finally(
+        () => {
+          clearTimeout(timeoutHandle);
+        },
+      )) as number;
+    } catch (error) {
+      if (error instanceof Error && error.message === "Sitemap fetch timeout") {
+        this.logger.warn("Sitemap fetch timed out", {
+          method: "tryGetSitemap",
+          timeout,
+          deliveredCount,
+        });
+      } else {
+        this.logger.error("Error fetching sitemap", {
+          method: "tryGetSitemap",
+          error,
+        });
+      }
+      count = deliveredCount;
+    }
+
+    try {
       if (count > 0) {
         if (
           await redisEvictConnection.sadd(
@@ -511,101 +734,39 @@ export class WebCrawler {
         3600,
         "NX",
       );
-
-      return count;
     } catch (error) {
-      if (error.message === "Sitemap fetch timeout") {
-        this.logger.warn("Sitemap fetch timed out", {
-          method: "tryGetSitemap",
-          timeout,
-        });
-        return 0;
-      }
-      this.logger.error("Error fetching sitemap", {
+      this.logger.error("Error dispatching initial URL after sitemap fetch", {
         method: "tryGetSitemap",
         error,
       });
-      return 0;
     }
+
+    return count;
   }
 
-  public filterURL(href: string, url: string): FilterResult {
-    let fullUrl = href;
-    if (!href.startsWith("http")) {
-      try {
-        fullUrl = new URL(href, url).toString();
-      } catch (_) {
-        return { allowed: false, denialReason: DenialReason.URL_PARSE_ERROR };
-      }
-    }
-    let urlObj;
-    try {
-      urlObj = new URL(fullUrl);
-    } catch (_) {
-      return { allowed: false, denialReason: DenialReason.URL_PARSE_ERROR };
-    }
-    const path = urlObj.pathname;
-
-    if (this.isInternalLink(fullUrl)) {
-      // INTERNAL LINKS
-      if (!this.noSections(fullUrl)) {
-        return { allowed: false, denialReason: DenialReason.SECTION_LINK };
-      }
-
-      if (this.matchesExcludes(path)) {
-        return { allowed: false, denialReason: DenialReason.EXCLUDE_PATTERN };
-      }
-
-      if (!this.isRobotsAllowed(fullUrl, this.ignoreRobotsTxt)) {
-        (async () => {
-          await redisEvictConnection.sadd(
-            "crawl:" + this.jobId + ":robots_blocked",
-            fullUrl,
-          );
-          await redisEvictConnection.expire(
-            "crawl:" + this.jobId + ":robots_blocked",
-            24 * 60 * 60,
-          );
-        })();
-        return { allowed: false, denialReason: DenialReason.ROBOTS_TXT };
-      }
-
-      return { allowed: true, url: fullUrl };
-    } else {
-      // EXTERNAL LINKS
-      if (this.isSocialMediaOrEmail(fullUrl)) {
-        return { allowed: false, denialReason: DenialReason.SOCIAL_MEDIA };
-      }
-
-      if (this.matchesExcludes(fullUrl, true)) {
-        return { allowed: false, denialReason: DenialReason.EXCLUDE_PATTERN };
-      }
-
-      if (
-        this.isInternalLink(url) &&
-        this.allowExternalContentLinks &&
-        !this.isExternalMainPage(fullUrl)
-      ) {
-        return { allowed: true, url: fullUrl };
-      }
-
-      if (
-        this.allowSubdomains &&
-        !this.isSocialMediaOrEmail(fullUrl) &&
-        this.isSubdomain(fullUrl)
-      ) {
-        return { allowed: true, url: fullUrl };
-      }
-
-      return { allowed: false, denialReason: DenialReason.EXTERNAL_LINK };
-    }
+  public async filterURL(
+    href: string,
+    url: string,
+    skipRobots: boolean = false,
+  ): Promise<FilterResult> {
+    return await filterUrl({
+      href: href,
+      url: url,
+      baseUrl: this.baseUrl,
+      excludes: this.excludes,
+      ignoreRobotsTxt: this.ignoreRobotsTxt || skipRobots,
+      robotsTxt: this.robotsTxt,
+      robotsUserAgent: this.robotsUserAgent,
+      allowExternalContentLinks: this.allowExternalContentLinks,
+      allowSubdomains: this.allowSubdomains,
+    });
   }
 
   private async extractLinksFromHTMLRust(html: string, url: string) {
     const links = await extractLinks(html);
     const filteredLinks: string[] = [];
     for (const link of links) {
-      const filterResult = this.filterURL(link, url);
+      const filterResult = await this.filterURL(link, url, true);
       if (filterResult.allowed && filterResult.url) {
         filteredLinks.push(filterResult.url);
       }
@@ -613,37 +774,61 @@ export class WebCrawler {
     return filteredLinks;
   }
 
-  private extractLinksFromHTMLCheerio(html: string, url: string) {
+  private async extractLinksFromHTMLCheerio(html: string, url: string) {
     let links: string[] = [];
 
     const $ = load(html);
-    $("a").each((_, element) => {
+    for (let i = 0; i < $("a").length; i++) {
+      const element = $("a")[i];
       let href = $(element).attr("href");
       if (href) {
         if (href.match(/^https?:\/[^\/]/)) {
           href = href.replace(/^https?:\//, "$&/");
         }
-        const filterResult = this.filterURL(href, url);
+        const filterResult = await this.filterURL(href, url, true);
         if (filterResult.allowed && filterResult.url) {
           links.push(filterResult.url);
         }
       }
-    });
+    }
 
     // Extract links from iframes with inline src
-    $("iframe").each((_, element) => {
+    for (let i = 0; i < $("iframe").length; i++) {
+      const element = $("iframe")[i];
       const src = $(element).attr("src");
       if (src && src.startsWith("data:text/html")) {
         const iframeHtml = decodeURIComponent(src.split(",")[1]);
-        const iframeLinks = this.extractLinksFromHTMLCheerio(iframeHtml, url);
+        const iframeLinks = await this.extractLinksFromHTMLCheerio(
+          iframeHtml,
+          url,
+        );
         links = links.concat(iframeLinks);
       }
-    });
+    }
 
     return links;
   }
 
-  public async extractLinksFromHTML(html: string, url: string) {
+  private async extractLinksFromMarkdownContent(text: string, url: string) {
+    const filteredLinks: string[] = [];
+    for (const link of extractLinksFromMarkdown(text, url)) {
+      const filterResult = await this.filterURL(link, url, true);
+      if (filterResult.allowed && filterResult.url) {
+        filteredLinks.push(filterResult.url);
+      }
+    }
+    return filteredLinks;
+  }
+
+  public async extractLinksFromContent(
+    html: string,
+    url: string,
+    contentType?: string,
+  ) {
+    if (isMarkdownContentType(contentType)) {
+      return await this.extractLinksFromMarkdownContent(html, url);
+    }
+
     try {
       return [
         ...new Set(
@@ -669,102 +854,19 @@ export class WebCrawler {
       );
     }
 
-    return this.extractLinksFromHTMLCheerio(html, url);
+    return await this.extractLinksFromHTMLCheerio(html, url);
   }
 
-  private isRobotsAllowed(
-    url: string,
-    ignoreRobotsTxt: boolean = false,
-  ): boolean {
-    return ignoreRobotsTxt ? true : isUrlAllowedByRobots(url, this.robots);
-  }
-
-  private matchesExcludes(url: string, onlyDomains: boolean = false): boolean {
-    return this.excludes.some(pattern => {
-      if (onlyDomains) return this.matchesExcludesExternalDomains(url);
-
-      return this.excludes.some(pattern => new RegExp(pattern).test(url));
-    });
-  }
-
-  // supported formats: "example.com/blog", "https://example.com", "blog.example.com", "example.com"
-  private matchesExcludesExternalDomains(url: string) {
-    try {
-      const urlObj = new URL(url);
-      const hostname = urlObj.hostname;
-      const pathname = urlObj.pathname;
-
-      for (let domain of this.excludes) {
-        let domainObj = new URL("http://" + domain.replace(/^https?:\/\//, ""));
-        let domainHostname = domainObj.hostname;
-        let domainPathname = domainObj.pathname;
-
-        if (
-          hostname === domainHostname ||
-          hostname.endsWith(`.${domainHostname}`)
-        ) {
-          if (pathname.startsWith(domainPathname)) {
-            return true;
-          }
-        }
-      }
-      return false;
-    } catch (e) {
-      return false;
-    }
-  }
-
-  private isExternalMainPage(url: string): boolean {
-    return !Boolean(
-      url
-        .split("/")
-        .slice(3)
-        .filter(subArray => subArray.length > 0).length,
+  /** Checks the crawl's robots.txt, honoring ignoreRobotsTxt. */
+  public isRobotsAllowed(url: string): boolean {
+    return (
+      this.ignoreRobotsTxt ||
+      isUrlAllowedByRobots(
+        url,
+        this.robots,
+        this.robotsUserAgent ? [this.robotsUserAgent] : undefined,
+      )
     );
-  }
-
-  private noSections(link: string): boolean {
-    // Allow URLs with hash fragments that represent actual routes/pages (like SPAs)
-    // but block simple anchor links within the same page
-    if (!link.includes("#")) {
-      return true;
-    }
-
-    // Check if the hash fragment looks like a route (contains forward slashes and has substantial content)
-    const hashPart = link.split("#")[1];
-    if (hashPart && hashPart.length > 1 && hashPart.includes("/")) {
-      return true;
-    }
-
-    return false;
-  }
-
-  private isInternalLink(link: string): boolean {
-    const urlObj = new URL(link, this.baseUrl);
-    const baseDomain = new URL(this.baseUrl).hostname
-      .replace(/^www\./, "")
-      .trim();
-    const linkDomain = urlObj.hostname.replace(/^www\./, "").trim();
-
-    return linkDomain === baseDomain;
-  }
-
-  private isSubdomain(link: string): boolean {
-    try {
-      const linkUrl = new URL(link, this.baseUrl);
-      const baseUrl = new URL(this.baseUrl);
-
-      const linkParsed = psl.parse(linkUrl.hostname);
-      const baseParsed = psl.parse(baseUrl.hostname);
-
-      if (!linkParsed?.domain || !baseParsed?.domain) {
-        return false;
-      }
-
-      return linkParsed.domain === baseParsed.domain;
-    } catch (error) {
-      return false;
-    }
   }
 
   public isFile(url: string): boolean {
@@ -810,22 +912,6 @@ export class WebCrawler {
     }
   }
 
-  private isSocialMediaOrEmail(url: string): boolean {
-    const socialMediaOrEmail = [
-      "facebook.com",
-      "twitter.com",
-      "linkedin.com",
-      "instagram.com",
-      "pinterest.com",
-      "mailto:",
-      "github.com",
-      "calendly.com",
-      "discord.gg",
-      "discord.com",
-    ];
-    return socialMediaOrEmail.some(ext => url.includes(ext));
-  }
-
   private async tryFetchSitemapLinks(
     url: string,
     urlsHandler: (urls: string[]) => unknown,
@@ -833,15 +919,19 @@ export class WebCrawler {
     mock?: string,
     maxAge?: number,
   ): Promise<number> {
-    const sitemapUrl = url.endsWith(".xml")
-      ? url
-      : `${url}${url.endsWith("/") ? "" : "/"}sitemap.xml`;
+    const sitemapUrl =
+      url.toLowerCase().endsWith(".xml") ||
+      url.toLowerCase().endsWith(".xml.gz")
+        ? url
+        : `${url}${url.endsWith("/") ? "" : "/"}sitemap.xml`;
 
     this.logger.debug("Trying to fetch sitemap links", {
       method: "tryFetchSitemapLinks",
       originalUrl: url,
       sitemapUrl,
+      maxAge,
       isXmlUrl: url.endsWith(".xml"),
+      isGzUrl: url.endsWith(".xml.gz"),
     });
 
     let sitemapCount: number = 0;
@@ -856,6 +946,8 @@ export class WebCrawler {
           maxAge,
           zeroDataRetention: this.zeroDataRetention,
           location: this.location,
+          usOnly: this.usOnly,
+          headers: this.headers,
         },
         this.logger,
         this.jobId,
@@ -879,49 +971,75 @@ export class WebCrawler {
     try {
       const urlObj = new URL(url);
       const hostname = urlObj.hostname;
-      const domainParts = hostname.split(".");
 
-      // Check if this is a subdomain (has more than 2 parts and not www)
-      if (domainParts.length > 2 && domainParts[0] !== "www") {
-        // Get the main domain by taking the last two parts
-        const mainDomain = domainParts.slice(-2).join(".");
-        const mainDomainUrl = `${urlObj.protocol}//${mainDomain}`;
-        const mainDomainSitemapUrl = `${mainDomainUrl}/sitemap.xml`;
+      // Skip subdomain logic for IP addresses (IPv4 or IPv6)
+      const isIPv4 = /^(\d{1,3}\.){3}\d{1,3}$/.test(hostname);
+      const isIPv6 = hostname.includes(":");
+      if (isIPv4 || isIPv6) {
+        // IP addresses don't have subdomains, skip this logic
+      } else {
+        // Resolve the registrable domain via the public suffix list rather than
+        // taking the last two labels: multi-part suffixes (co.uk, co.il, co.jp,
+        // com.au) have three labels, so slicing produced the bare suffix and we
+        // ended up requesting https://co.il/sitemap.xml, which cannot resolve.
+        // Returns null for hosts with no registrable domain (e.g. localhost).
+        const mainDomain = extractBaseDomain(url);
 
-        try {
-          // Get all links from the main domain's sitemap
-          sitemapCount += await getLinksFromSitemap(
-            {
-              sitemapUrl: mainDomainSitemapUrl,
-              urlsHandler(urls) {
-                return urlsHandler(
-                  urls.filter(link => {
-                    try {
-                      const linkUrl = new URL(link);
-                      return linkUrl.hostname.endsWith(hostname);
-                    } catch {}
-                  }),
-                );
+        // Only worth a second fetch when the host actually *is* a subdomain of
+        // that domain; skip www, which serves the same sitemap.
+        if (
+          mainDomain &&
+          mainDomain !== hostname &&
+          hostname !== `www.${mainDomain}`
+        ) {
+          const mainDomainUrl = `${urlObj.protocol}//${mainDomain}`;
+          const mainDomainSitemapUrl = `${mainDomainUrl}/sitemap.xml`;
+
+          try {
+            // Get all links from the main domain's sitemap
+            sitemapCount += await getLinksFromSitemap(
+              {
+                sitemapUrl: mainDomainSitemapUrl,
+                urlsHandler(urls) {
+                  return urlsHandler(
+                    urls.filter(link => {
+                      try {
+                        const linkUrl = new URL(link);
+                        // Match on a DNS-label boundary. A bare endsWith also
+                        // accepts sibling hosts that merely share a suffix of the
+                        // final label — evilcrm.danetcomm.co.il "ends with"
+                        // crm.danetcomm.co.il — which would pull an unrelated
+                        // host into this crawl. Real child subdomains still pass.
+                        return (
+                          linkUrl.hostname === hostname ||
+                          linkUrl.hostname.endsWith(`.${hostname}`)
+                        );
+                      } catch {}
+                    }),
+                  );
+                },
+                mode: "fire-engine",
+                maxAge,
+                zeroDataRetention: this.zeroDataRetention,
+                location: this.location,
+                usOnly: this.usOnly,
+                headers: this.headers,
               },
-              mode: "fire-engine",
-              maxAge,
-              zeroDataRetention: this.zeroDataRetention,
-              location: this.location,
-            },
-            this.logger,
-            this.jobId,
-            this.sitemapsHit,
-            abort,
-            mock,
-          );
-        } catch (error) {
-          if (error instanceof ScrapeJobTimeoutError) {
-            throw error;
-          } else {
-            this.logger.debug(
-              `Failed to fetch main domain sitemap from ${mainDomainSitemapUrl}`,
-              { method: "tryFetchSitemapLinks", mainDomainSitemapUrl, error },
+              this.logger,
+              this.jobId,
+              this.sitemapsHit,
+              abort,
+              mock,
             );
+          } catch (error) {
+            if (error instanceof ScrapeJobTimeoutError) {
+              throw error;
+            } else {
+              this.logger.debug(
+                `Failed to fetch main domain sitemap from ${mainDomainSitemapUrl}`,
+                { method: "tryFetchSitemapLinks", mainDomainSitemapUrl, error },
+              );
+            }
           }
         }
       }
@@ -949,6 +1067,8 @@ export class WebCrawler {
             maxAge,
             zeroDataRetention: this.zeroDataRetention,
             location: this.location,
+            usOnly: this.usOnly,
+            headers: this.headers,
           },
           this.logger,
           this.jobId,
@@ -976,6 +1096,8 @@ export class WebCrawler {
                 maxAge,
                 zeroDataRetention: this.zeroDataRetention,
                 location: this.location,
+                usOnly: this.usOnly,
+                headers: this.headers,
               },
               this.logger,
               this.jobId,

@@ -1,4 +1,5 @@
-import { WebScraperOptions, RunWebScraperParams } from "../types";
+import { PaywalledContentError } from "../scraper/scrapeURL/error";
+import { ScrapeJobSingleUrls, RunWebScraperParams } from "../types";
 import { logger as _logger } from "../lib/logger";
 import { configDotenv } from "dotenv";
 import { scrapeURL, ScrapeUrlResponse } from "../scraper/scrapeURL";
@@ -10,12 +11,11 @@ export async function startWebScraperPipeline({
   job,
   costTracking,
 }: {
-  job: NuQJob<WebScraperOptions>;
+  job: NuQJob<ScrapeJobSingleUrls>;
   costTracking: CostTracking;
 }) {
   return await runWebScraper({
     url: job.data.url,
-    mode: job.data.mode,
     scrapeOptions: {
       ...job.data.scrapeOptions,
       ...(job.data.crawl_id
@@ -29,12 +29,14 @@ export async function startWebScraperPipeline({
     internalOptions: {
       crawlId: job.data.crawl_id,
       teamId: job.data.team_id,
+      origin: job.data.origin,
       ...job.data.internalOptions,
+      // In-flight jobs enqueued before orgId existed may omit it.
+      orgId: job.data.internalOptions?.orgId ?? null,
     },
     team_id: job.data.team_id,
     bull_job_id: job.id,
     priority: job.priority,
-    is_scrape: job.data.is_scrape ?? false,
     is_crawl: !!(job.data.crawl_id && job.data.crawlerOptions !== null),
     urlInvisibleInCurrentCrawl:
       job.data.crawlerOptions?.urlInvisibleInCurrentCrawl ?? false,
@@ -44,13 +46,11 @@ export async function startWebScraperPipeline({
 
 async function runWebScraper({
   url,
-  mode,
   scrapeOptions,
   internalOptions,
   team_id,
   bull_job_id,
   priority,
-  is_scrape = false,
   is_crawl = false,
   urlInvisibleInCurrentCrawl = false,
   costTracking,
@@ -93,6 +93,7 @@ async function runWebScraper({
           ...internalOptions,
           urlInvisibleInCurrentCrawl,
           teamId: internalOptions?.teamId ?? team_id,
+          orgId: internalOptions?.orgId ?? null,
         },
         costTracking,
       );
@@ -121,6 +122,7 @@ async function runWebScraper({
       }
     } catch (_error) {
       error = _error;
+      if (_error instanceof PaywalledContentError) break;
     }
   }
 

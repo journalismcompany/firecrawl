@@ -1,4 +1,20 @@
-import { extract, idmux, Identity } from "./lib";
+import request from "supertest";
+import {
+  ALLOW_TEST_SUITE_WEBSITE,
+  HAS_AI,
+  itIf,
+  TEST_API_URL,
+  TEST_PRODUCTION,
+  TEST_SUITE_WEBSITE,
+} from "../lib";
+import {
+  describeExtract,
+  EXTRACT_LIVE,
+  EXTRACT_SUNSET,
+  extract,
+  idmux,
+  Identity,
+} from "./lib";
 
 let identity: Identity;
 
@@ -10,18 +26,15 @@ beforeAll(async () => {
   });
 }, 10000);
 
-describe("Extract tests", () => {
-  if (
-    !process.env.TEST_SUITE_SELF_HOSTED ||
-    process.env.OPENAI_API_KEY ||
-    process.env.OLLAMA_BASE_URL
-  ) {
+describeExtract(TEST_PRODUCTION || (HAS_AI && ALLOW_TEST_SUITE_WEBSITE))(
+  "Extract tests",
+  () => {
     it.concurrent(
       "works",
       async () => {
         const res = await extract(
           {
-            urls: ["https://firecrawl.dev"],
+            urls: [TEST_SUITE_WEBSITE],
             schema: {
               type: "object",
               properties: {
@@ -56,7 +69,7 @@ describe("Extract tests", () => {
       async () => {
         const res = await extract(
           {
-            urls: ["https://firecrawl.dev"],
+            urls: [TEST_SUITE_WEBSITE],
             schema: {
               type: "object",
               properties: {
@@ -80,9 +93,25 @@ describe("Extract tests", () => {
       },
       90000,
     );
-  } else {
-    it.concurrent("dummy test", () => {
-      expect(true).toBe(true);
-    });
-  }
-});
+  },
+);
+
+itIf(!EXTRACT_LIVE)(
+  "POST /v1/extract answers 410 after the extract sunset",
+  async () => {
+    const res = await request(TEST_API_URL)
+      .post("/v1/extract")
+      .set("Authorization", `Bearer ${identity.apiKey}`)
+      .set("Content-Type", "application/json")
+      .send({ urls: [TEST_SUITE_WEBSITE], prompt: "Extract the page title." });
+
+    expect(res.statusCode).toBe(410);
+    expect(res.body.code).toBe("ENDPOINT_REMOVED");
+    expect(res.body.replacement).toBe("/v2/scrape");
+    expect(res.body.documentation_url).toBe(
+      "https://docs.firecrawl.dev/migrating-from-extract",
+    );
+    expect(res.headers["sunset"]).toBe(new Date(EXTRACT_SUNSET).toUTCString());
+  },
+  30000,
+);

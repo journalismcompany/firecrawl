@@ -1,4 +1,10 @@
-import { scrape, scrapeTimeout, idmux, Identity } from "./lib";
+import {
+  ALLOW_TEST_SUITE_WEBSITE,
+  HAS_AI,
+  TEST_PRODUCTION,
+  TEST_SUITE_WEBSITE,
+} from "../lib";
+import { describeV1, scrape, scrapeTimeout, idmux, Identity } from "./lib";
 
 let identity: Identity;
 
@@ -10,19 +16,16 @@ beforeAll(async () => {
   });
 }, 10000 + scrapeTimeout);
 
-describe("V1 JSON/Extract Format Backward Compatibility", () => {
-  if (
-    !process.env.TEST_SUITE_SELF_HOSTED ||
-    process.env.OPENAI_API_KEY ||
-    process.env.OLLAMA_BASE_URL
-  ) {
+describeV1(TEST_PRODUCTION || (HAS_AI && ALLOW_TEST_SUITE_WEBSITE))(
+  "V1 JSON/Extract Format Backward Compatibility",
+  () => {
     describe("extract format", () => {
       it.concurrent(
         "should return extracted data in 'extract' field when using format='extract'",
         async () => {
           const response = await scrape(
             {
-              url: "https://jsonplaceholder.typicode.com/posts/1",
+              url: `${TEST_SUITE_WEBSITE}/example.json`,
               formats: ["extract"],
               extract: {
                 schema: {
@@ -57,7 +60,7 @@ describe("V1 JSON/Extract Format Backward Compatibility", () => {
         async () => {
           const response = await scrape(
             {
-              url: "https://firecrawl.dev",
+              url: TEST_SUITE_WEBSITE,
               formats: ["extract"],
               extract: {
                 prompt: "Extract the main heading from the page",
@@ -79,7 +82,7 @@ describe("V1 JSON/Extract Format Backward Compatibility", () => {
           expect(response.json).toBeUndefined();
           expect(response.extract.mainHeading).toBeDefined();
         },
-        scrapeTimeout,
+        scrapeTimeout * 2,
       );
     });
 
@@ -89,7 +92,7 @@ describe("V1 JSON/Extract Format Backward Compatibility", () => {
         async () => {
           const response = await scrape(
             {
-              url: "https://jsonplaceholder.typicode.com/posts/1",
+              url: `${TEST_SUITE_WEBSITE}/example.json`,
               formats: ["json"],
               jsonOptions: {
                 schema: {
@@ -124,7 +127,7 @@ describe("V1 JSON/Extract Format Backward Compatibility", () => {
         async () => {
           const response = await scrape(
             {
-              url: "https://firecrawl.dev",
+              url: TEST_SUITE_WEBSITE,
               formats: ["json"],
               jsonOptions: {
                 prompt: "Extract the main heading from the page",
@@ -146,7 +149,7 @@ describe("V1 JSON/Extract Format Backward Compatibility", () => {
           expect(response.extract).toBeUndefined();
           expect(response.json.mainHeading).toBeDefined();
         },
-        scrapeTimeout,
+        scrapeTimeout * 2,
       );
     });
 
@@ -156,7 +159,7 @@ describe("V1 JSON/Extract Format Backward Compatibility", () => {
         async () => {
           const response = await scrape(
             {
-              url: "https://firecrawl.dev",
+              url: TEST_SUITE_WEBSITE,
               formats: ["markdown", "extract"],
               extract: {
                 schema: {
@@ -188,7 +191,7 @@ describe("V1 JSON/Extract Format Backward Compatibility", () => {
         async () => {
           const response = await scrape(
             {
-              url: "https://firecrawl.dev",
+              url: TEST_SUITE_WEBSITE,
               formats: ["markdown", "json"],
               jsonOptions: {
                 schema: {
@@ -215,9 +218,5 @@ describe("V1 JSON/Extract Format Backward Compatibility", () => {
         scrapeTimeout,
       );
     });
-  } else {
-    it("should skip LLM tests in self-hosted mode without LLM keys", () => {
-      expect(true).toBe(true);
-    });
-  }
-});
+  },
+);

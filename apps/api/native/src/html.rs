@@ -1,18 +1,26 @@
 use std::collections::{HashMap, HashSet};
 
+use std::sync::LazyLock;
+
 use kuchikiki::{iter::NodeEdge, parse_html, traits::TendrilSink, NodeRef};
 use napi_derive::napi;
 use nodesig::{get_node_signature, SignatureMode};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::task;
 use url::Url;
+
+static URL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+  Regex::new(r#"url\(['"]?([^'")]+)['"]?\)"#).expect("URL_REGEX is a valid static regex pattern")
+});
 
 use crate::utils::to_napi_err;
 
 fn _extract_base_href_from_document(
   document: &NodeRef,
   url: &Url,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
   if let Some(base) = document
     .select("base[href]")
     .map_err(|_| "Failed to select base href".to_string())?
@@ -27,31 +35,41 @@ fn _extract_base_href_from_document(
   Ok(url.to_string())
 }
 
-fn _extract_base_href(html: &str, url: &str) -> Result<String, Box<dyn std::error::Error>> {
-  let document = parse_html().one(html);
+/// Base URL of an already-parsed document: its `<base href>` if it has one,
+/// otherwise the page URL.
+pub fn base_href_of_document(document: &NodeRef, url: &Url) -> String {
+  _extract_base_href_from_document(document, url).unwrap_or_else(|_| url.to_string())
+}
+
+fn _extract_base_href(
+  html: &str,
+  url: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+  let document = parse_html().one(html).document_node;
   let url = Url::parse(url)?;
   _extract_base_href_from_document(&document, &url)
 }
 
 /// Extract the base href from HTML document.
 #[napi]
-pub fn extract_base_href(html: String, url: String) -> napi::Result<String> {
-  _extract_base_href(&html, &url).map_err(to_napi_err)
+pub async fn extract_base_href(html: String, url: String) -> napi::Result<String> {
+  let res = task::spawn_blocking(move || _extract_base_href(&html, &url))
+    .await
+    .map_err(|e| {
+      napi::Error::new(
+        napi::Status::GenericFailure,
+        format!("extract_base_href join error: {e}"),
+      )
+    })?;
+
+  res.map_err(to_napi_err)
 }
 
-/// Extract all links from HTML document.
-#[napi]
-pub fn extract_links(html: Option<String>) -> napi::Result<Vec<String>> {
-  let html = match html {
-    Some(h) => h,
-    None => return Ok(Vec::new()),
-  };
-
-  let document = parse_html().one(html.as_str());
-
+/// Raw `href` of every link in an already-parsed document.
+pub fn extract_links_from_document(document: &NodeRef) -> Result<Vec<String>, String> {
   let anchors: Vec<_> = document
     .select("a[href]")
-    .map_err(|_| to_napi_err("Failed to select links"))?
+    .map_err(|_| "Failed to select links".to_string())?
     .collect();
 
   let mut out: Vec<String> = Vec::new();
@@ -72,6 +90,27 @@ pub fn extract_links(html: Option<String>) -> napi::Result<Vec<String>> {
   }
 
   Ok(out)
+}
+
+/// Extract all links from HTML document.
+#[napi]
+pub async fn extract_links(html: Option<String>) -> napi::Result<Vec<String>> {
+  task::spawn_blocking(move || {
+    let html = match html {
+      Some(h) => h,
+      None => return Ok(Vec::new()),
+    };
+
+    let document = parse_html().one(html.as_str()).document_node;
+    extract_links_from_document(&document).map_err(to_napi_err)
+  })
+  .await
+  .map_err(|e| {
+    napi::Error::new(
+      napi::Status::GenericFailure,
+      format!("extract_links join error: {e}"),
+    )
+  })?
 }
 
 macro_rules! insert_meta_name {
@@ -112,11 +151,27 @@ macro_rules! insert_meta_property {
   };
 }
 
-fn _extract_metadata(html: &str) -> Result<HashMap<String, Value>, Box<dyn std::error::Error>> {
-  let document = parse_html().one(html);
+fn _extract_metadata(
+  html: &str,
+) -> Result<HashMap<String, Value>, Box<dyn std::error::Error + Send + Sync>> {
+  let document = parse_html().one(html).document_node;
+  extract_metadata_from_document(&document)
+}
+
+/// Metadata of an already-parsed document.
+pub fn extract_metadata_from_document(
+  document: &NodeRef,
+) -> Result<HashMap<String, Value>, Box<dyn std::error::Error + Send + Sync>> {
   let mut out = HashMap::<String, Value>::new();
 
-  if let Some(title) = document
+  let head_node = document
+    .select("head")
+    .map_err(|_| "Failed to select head")?
+    .next();
+
+  let search_root = head_node.as_ref().map(|h| h.as_node()).unwrap_or(&document);
+
+  if let Some(title) = search_root
     .select("title")
     .map_err(|_| "Failed to select title")?
     .next()
@@ -124,13 +179,13 @@ fn _extract_metadata(html: &str) -> Result<HashMap<String, Value>, Box<dyn std::
     out.insert("title".to_string(), Value::String(title.text_contents()));
   }
 
-  if let Some(favicon_link) = document
+  if let Some(favicon_link) = search_root
     .select("link[rel=\"icon\"]")
     .map_err(|_| "Failed to select favicon")?
     .next()
     .and_then(|x| x.attributes.borrow().get("href").map(|x| x.to_string()))
     .or_else(|| {
-      document
+      search_root
         .select("link[rel*=\"icon\"]")
         .ok()
         .and_then(|mut x| {
@@ -151,15 +206,15 @@ fn _extract_metadata(html: &str) -> Result<HashMap<String, Value>, Box<dyn std::
     out.insert("language".to_string(), Value::String(lang));
   }
 
-  insert_meta_property!(out, document, "og:title", "ogTitle");
-  insert_meta_property!(out, document, "og:description", "ogDescription");
-  insert_meta_property!(out, document, "og:url", "ogUrl");
-  insert_meta_property!(out, document, "og:image", "ogImage");
-  insert_meta_property!(out, document, "og:audio", "ogAudio");
-  insert_meta_property!(out, document, "og:determiner", "ogDeterminer");
-  insert_meta_property!(out, document, "og:locale", "ogLocale");
+  insert_meta_property!(out, search_root, "og:title", "ogTitle");
+  insert_meta_property!(out, search_root, "og:description", "ogDescription");
+  insert_meta_property!(out, search_root, "og:url", "ogUrl");
+  insert_meta_property!(out, search_root, "og:image", "ogImage");
+  insert_meta_property!(out, search_root, "og:audio", "ogAudio");
+  insert_meta_property!(out, search_root, "og:determiner", "ogDeterminer");
+  insert_meta_property!(out, search_root, "og:locale", "ogLocale");
 
-  for meta in document
+  for meta in search_root
     .select("meta[property=\"og:locale:alternate\"]")
     .map_err(|_| "Failed to select og locale alternate")?
   {
@@ -216,7 +271,7 @@ fn _extract_metadata(html: &str) -> Result<HashMap<String, Value>, Box<dyn std::
               if name == "description" {
                 out.insert(
                   name.to_string(),
-                  Value::String(format!("{}, {}", existing, content)),
+                  Value::String(format!("{existing}, {content}")),
                 );
               } else if name != "title" {
                 out.insert(
@@ -255,21 +310,46 @@ fn _extract_metadata(html: &str) -> Result<HashMap<String, Value>, Box<dyn std::
     }
   }
 
+  // Backfill title from og:title, twitter:title, or meta[name="title"] if primary extraction failed
+  if !out.contains_key("title") {
+    let fallback_title = out
+      .get("ogTitle")
+      .or_else(|| out.get("og:title"))
+      .or_else(|| out.get("twitter:title"))
+      .and_then(|v| match v {
+        Value::String(s) if !s.is_empty() => Some(s.clone()),
+        _ => None,
+      });
+
+    if let Some(title) = fallback_title {
+      out.insert("title".to_string(), Value::String(title));
+    }
+  }
+
   Ok(out)
 }
 
 /// Extract metadata from HTML document.
 #[napi]
-pub fn extract_metadata(html: Option<String>) -> napi::Result<HashMap<String, Value>> {
-  let html = match html {
-    Some(h) => h,
-    None => return Ok(HashMap::new()),
-  };
+pub async fn extract_metadata(html: Option<String>) -> napi::Result<HashMap<String, Value>> {
+  task::spawn_blocking(move || {
+    let html = match html {
+      Some(h) => h,
+      None => return Ok(HashMap::new()),
+    };
 
-  _extract_metadata(&html).map_err(to_napi_err)
+    _extract_metadata(&html).map_err(to_napi_err)
+  })
+  .await
+  .map_err(|e| {
+    napi::Error::new(
+      napi::Status::GenericFailure,
+      format!("extract_metadata join error: {e}"),
+    )
+  })?
 }
 
-const EXCLUDE_NON_MAIN_TAGS: [&str; 42] = [
+const EXCLUDE_NON_MAIN_TAGS: [&str; 48] = [
   "header",
   "footer",
   "nav",
@@ -311,7 +391,20 @@ const EXCLUDE_NON_MAIN_TAGS: [&str; 42] = [
   "#widget",
   ".cookie",
   "#cookie",
+  "[aria-label=\"Cookie consent\" i]",
   ".fc-decoration",
+  ".grecaptcha-badge",
+  "[data-original-tag=\"iframe\"][src*=\"google.com/recaptcha/\"]",
+  "[data-original-tag=\"iframe\"][src*=\"recaptcha.net/recaptcha/\"]",
+  "[data-original-tag=\"iframe\"][src*=\"hcaptcha.com\"]",
+  "[data-original-tag=\"iframe\"][src*=\"challenges.cloudflare.com\"]",
+];
+
+// Inlined documents of embedded players hold only player chrome, never page content.
+const EMPTY_NON_MAIN_FRAMES: [&str; 3] = [
+  "[data-original-tag=\"iframe\"][src*=\"player.vimeo.com/\"]",
+  "[data-original-tag=\"iframe\"][src*=\"youtube.com/embed/\"]",
+  "[data-original-tag=\"iframe\"][src*=\"youtube-nocookie.com/embed/\"]",
 ];
 
 const FORCE_INCLUDE_MAIN_TAGS: [&str; 13] = [
@@ -349,15 +442,26 @@ struct ImageSource {
   is_x: bool,
 }
 
-fn _transform_html_inner(opts: TransformHtmlOptions) -> Result<String, Box<dyn std::error::Error>> {
-  let mut document = parse_html().one(opts.html.as_ref());
+fn _transform_html_inner(
+  opts: TransformHtmlOptions,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+  let document = parse_html().one(opts.html.as_ref()).document_node;
+  Ok(transform_document(document, &opts)?.to_string())
+}
+
+/// Clean an already-parsed document with the same rules as `transform_html`,
+/// without parsing it again. `opts.html` is ignored.
+pub fn transform_document(
+  mut document: NodeRef,
+  opts: &TransformHtmlOptions,
+) -> Result<NodeRef, Box<dyn std::error::Error + Send + Sync>> {
   let url = Url::parse(&_extract_base_href_from_document(
     &document,
     &Url::parse(&opts.url)?,
   )?)?;
 
   if !opts.include_tags.is_empty() {
-    let new_document = parse_html().one("<div></div>");
+    let new_document = parse_html().one("<div></div>").document_node;
     let root = new_document
       .select_first("div")
       .map_err(|_| "Failed to select root element")?;
@@ -402,7 +506,7 @@ fn _transform_html_inner(opts: TransformHtmlOptions) -> Result<String, Box<dyn s
         .collect::<HashSet<_>>();
 
       for mode in modes {
-        let matcher = format!(":{}:", Into::<String>::into(mode.clone()));
+        let matcher = format!(":{}:", Into::<String>::into(mode));
         let signatures = signatures
           .iter()
           .filter(|x| x.contains(&matcher))
@@ -420,7 +524,7 @@ fn _transform_html_inner(opts: TransformHtmlOptions) -> Result<String, Box<dyn s
                 continue;
               }
 
-              let signature = get_node_signature(&node, mode.clone());
+              let signature = get_node_signature(&node, mode);
               if signatures.contains(&signature) {
                 nodes_to_drop.push(node);
               }
@@ -458,72 +562,110 @@ fn _transform_html_inner(opts: TransformHtmlOptions) -> Result<String, Box<dyn s
         }
       }
     }
+
+    for x in EMPTY_NON_MAIN_FRAMES.iter() {
+      let frames: Vec<_> = document
+        .select(x)
+        .map_err(|_| "Failed to select frames")?
+        .collect();
+      for frame in frames {
+        while let Some(child) = frame.as_node().first_child() {
+          child.detach();
+        }
+      }
+    }
   }
 
-  let srcset_images: Vec<_> = document
-    .select("img[srcset]")
-    .map_err(|_| "Failed to select srcset images")?
+  // Resolve images, including lazy-loaded ones. Many sites ship a tiny
+  // placeholder in `src` and keep the real image in `data-srcset` / `data-src`,
+  // swapping it in via JS only once the image scrolls into view. When the real
+  // `srcset` isn't present yet, fall back to those lazy-load attributes so we
+  // emit the actual image instead of the placeholder. Images that already have
+  // a `srcset` are handled exactly as before.
+  let imgs: Vec<_> = document
+    .select("img")
+    .map_err(|_| "Failed to select images")?
     .collect();
-  for img in srcset_images {
-    let mut sizes: Vec<ImageSource> = img
-      .attributes
-      .borrow()
-      .get("srcset")
-      .ok_or("Failed to get srcset")?
-      .split(',')
-      .filter_map(|x| {
-        let tok: Vec<&str> = x.trim().split(' ').collect();
-        let last_token = tok[tok.len() - 1];
-        let (last_token, last_token_used) = if tok.len() > 1
-          && !last_token.is_empty()
-          && (last_token.ends_with('x') || last_token.ends_with('w'))
-        {
-          (last_token, true)
-        } else {
-          ("1x", false)
-        };
+  for img in imgs {
+    let srcset = {
+      let attrs = img.attributes.borrow();
+      attrs
+        .get("srcset")
+        .filter(|x| !x.trim().is_empty())
+        .or_else(|| attrs.get("data-srcset").filter(|x| !x.trim().is_empty()))
+        .map(|x| x.to_string())
+    };
 
-        if let Some((last_index, _)) = last_token.char_indices().last() {
-          if let Ok(parsed_size) = last_token[..last_index].parse() {
-            Some(ImageSource {
-              url: if last_token_used {
-                tok[0..tok.len() - 1].join(" ")
-              } else {
-                tok.join(" ")
-              },
-              size: parsed_size,
-              is_x: last_token.ends_with('x'),
-            })
+    if let Some(srcset) = srcset {
+      let mut sizes: Vec<ImageSource> = srcset
+        .split(',')
+        .filter_map(|x| {
+          let tok: Vec<&str> = x.trim().split(' ').collect();
+          let last_token = tok[tok.len() - 1];
+          let (last_token, last_token_used) = if tok.len() > 1
+            && !last_token.is_empty()
+            && (last_token.ends_with('x') || last_token.ends_with('w'))
+          {
+            (last_token, true)
+          } else {
+            ("1x", false)
+          };
+
+          if let Some((last_index, _)) = last_token.char_indices().last() {
+            if let Ok(parsed_size) = last_token[..last_index].parse() {
+              Some(ImageSource {
+                url: if last_token_used {
+                  tok[0..tok.len() - 1].join(" ")
+                } else {
+                  tok.join(" ")
+                },
+                size: parsed_size,
+                is_x: last_token.ends_with('x'),
+              })
+            } else {
+              None
+            }
           } else {
             None
           }
-        } else {
-          None
+        })
+        .collect();
+
+      if sizes.iter().all(|x| x.is_x) {
+        if let Some(src) = img.attributes.borrow().get("src").map(|x| x.to_string()) {
+          sizes.push(ImageSource {
+            url: src,
+            size: 1.0,
+            is_x: true,
+          });
         }
-      })
-      .collect();
-
-    if sizes.iter().all(|x| x.is_x) {
-      if let Some(src) = img.attributes.borrow().get("src").map(|x| x.to_string()) {
-        sizes.push(ImageSource {
-          url: src,
-          size: 1.0,
-          is_x: true,
-        });
       }
-    }
 
-    sizes.sort_by(|a, b| {
-      b.size
-        .partial_cmp(&a.size)
-        .unwrap_or(std::cmp::Ordering::Equal)
-    });
+      sizes.sort_by(|a, b| {
+        b.size
+          .partial_cmp(&a.size)
+          .unwrap_or(std::cmp::Ordering::Equal)
+      });
 
-    if let Some(biggest) = sizes.first() {
-      img
-        .attributes
-        .borrow_mut()
-        .insert("src", biggest.url.clone());
+      if let Some(biggest) = sizes.first() {
+        img
+          .attributes
+          .borrow_mut()
+          .insert("src", biggest.url.clone());
+      }
+    } else {
+      // No usable `srcset`/`data-srcset`: fall back to `data-src` for the
+      // common lazy-load case where only a single image URL is deferred.
+      let data_src = {
+        let attrs = img.attributes.borrow();
+        attrs
+          .get("data-src")
+          .filter(|x| !x.trim().is_empty())
+          .map(|x| x.to_string())
+      };
+      if let Some(data_src) = data_src {
+        img.attributes.borrow_mut().insert("src", data_src);
+      }
     }
   }
 
@@ -562,23 +704,47 @@ fn _transform_html_inner(opts: TransformHtmlOptions) -> Result<String, Box<dyn s
     }
   }
 
-  Ok(document.to_string())
+  Ok(document)
 }
 
 /// Transform and clean HTML content based on provided options.
 #[napi]
-pub fn transform_html(opts: TransformHtmlOptions) -> napi::Result<String> {
-  _transform_html_inner(opts).map_err(to_napi_err)
+pub async fn transform_html(opts: TransformHtmlOptions) -> napi::Result<String> {
+  let res = task::spawn_blocking(move || _transform_html_inner(opts))
+    .await
+    .map_err(|e| {
+      napi::Error::new(
+        napi::Status::GenericFailure,
+        format!("transform_html join error: {e}"),
+      )
+    })?;
+
+  res.map_err(to_napi_err)
 }
 
 fn _get_inner_json(html: &str) -> Result<String, ()> {
-  Ok(parse_html().one(html).select_first("body")?.text_contents())
+  Ok(
+    parse_html()
+      .one(html)
+      .document_node
+      .select_first("body")?
+      .text_contents(),
+  )
 }
 
 /// Extract inner text content from HTML body.
 #[napi]
-pub fn get_inner_json(html: String) -> napi::Result<String> {
-  _get_inner_json(&html).map_err(|_| to_napi_err("Failed to get inner JSON"))
+pub async fn get_inner_json(html: String) -> napi::Result<String> {
+  let res = task::spawn_blocking(move || _get_inner_json(&html))
+    .await
+    .map_err(|e| {
+      napi::Error::new(
+        napi::Status::GenericFailure,
+        format!("get_inner_json join error: {e}"),
+      )
+    })?;
+
+  res.map_err(|_| to_napi_err("Failed to get inner JSON"))
 }
 
 #[derive(Deserialize, Serialize)]
@@ -605,8 +771,8 @@ pub struct ExtractedAttributeResult {
 fn _extract_attributes(
   html: &str,
   options: &ExtractAttributesOptions,
-) -> Result<Vec<ExtractedAttributeResult>, Box<dyn std::error::Error>> {
-  let document = parse_html().one(html);
+) -> Result<Vec<ExtractedAttributeResult>, Box<dyn std::error::Error + Send + Sync>> {
+  let document = parse_html().one(html).document_node;
   let mut results = Vec::new();
 
   for selector_config in &options.selectors {
@@ -652,21 +818,36 @@ fn _extract_attributes(
 
 /// Extract specified attributes from HTML elements matching selectors.
 #[napi]
-pub fn extract_attributes(
+pub async fn extract_attributes(
   html: String,
   options: ExtractAttributesOptions,
 ) -> napi::Result<Vec<ExtractedAttributeResult>> {
-  _extract_attributes(&html, &options).map_err(to_napi_err)
+  let res = task::spawn_blocking(move || _extract_attributes(&html, &options))
+    .await
+    .map_err(|e| {
+      napi::Error::new(
+        napi::Status::GenericFailure,
+        format!("extract_attributes join error: {e}"),
+      )
+    })?;
+
+  res.map_err(to_napi_err)
 }
 
-fn _extract_images(html: &str, base_url: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-  let document = parse_html().one(html);
+fn _extract_images(
+  html: &str,
+  base_url: &str,
+) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+  let document = parse_html().one(html).document_node;
   let base_url = Url::parse(base_url)?;
   let base_href = _extract_base_href_from_document(&document, &base_url)?;
   let base_href_url = Url::parse(&base_href)?;
   let mut images = HashSet::<String>::new();
 
-  let resolve_image_url = |src: &str| -> Result<String, Box<dyn std::error::Error>> {
+  let resolve_image_url = |src: &str| -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    if src.trim().is_empty() {
+      return Err("empty image URL".into());
+    }
     if src.starts_with("data:") || src.starts_with("blob:") {
       return Ok(src.to_string());
     }
@@ -707,7 +888,7 @@ fn _extract_images(html: &str, base_url: &str) -> Result<Vec<String>, Box<dyn st
 
     if let Some(srcset) = attrs.get("srcset") {
       for part in srcset.split(',') {
-        if let Some(url) = part.trim().split_whitespace().next() {
+        if let Some(url) = part.split_whitespace().next() {
           if !url.is_empty() {
             if let Ok(resolved) = resolve_image_url(url) {
               images.insert(resolved);
@@ -730,7 +911,7 @@ fn _extract_images(html: &str, base_url: &str) -> Result<Vec<String>, Box<dyn st
   for source in source_elements {
     if let Some(srcset) = source.attributes.borrow().get("srcset") {
       for part in srcset.split(',') {
-        if let Some(url) = part.trim().split_whitespace().next() {
+        if let Some(url) = part.split_whitespace().next() {
           if !url.is_empty() {
             if let Ok(resolved) = resolve_image_url(url) {
               images.insert(resolved);
@@ -793,6 +974,24 @@ fn _extract_images(html: &str, base_url: &str) -> Result<Vec<String>, Box<dyn st
     }
   }
 
+  // <... style="background: url(...)"> or <... style="background-image: url(...)">
+  if let Ok(elements) = document.select("[style*=\"background\"]") {
+    for element in elements {
+      if let Some(style) = element.attributes.borrow().get("style") {
+        for cap in URL_REGEX.captures_iter(style) {
+          if let Some(url_match) = cap.get(1) {
+            let url = url_match.as_str().trim();
+            if !url.is_empty() {
+              if let Ok(resolved) = resolve_image_url(url) {
+                images.insert(resolved);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
   let filtered_images: Vec<String> = images
     .into_iter()
     .filter(|url| !url.to_lowercase().starts_with("javascript:"))
@@ -805,6 +1004,101 @@ fn _extract_images(html: &str, base_url: &str) -> Result<Vec<String>, Box<dyn st
 
 /// Extract all image URLs from HTML document.
 #[napi]
-pub fn extract_images(html: String, base_url: String) -> napi::Result<Vec<String>> {
-  _extract_images(&html, &base_url).map_err(to_napi_err)
+pub async fn extract_images(html: String, base_url: String) -> napi::Result<Vec<String>> {
+  let res = task::spawn_blocking(move || _extract_images(&html, &base_url))
+    .await
+    .map_err(|e| {
+      napi::Error::new(
+        napi::Status::GenericFailure,
+        format!("extract_images join error: {e}"),
+      )
+    })?;
+
+  res.map_err(to_napi_err)
+}
+
+/// The synchronous body of `post_process_markdown`.
+pub fn post_process_markdown_text(markdown: &str) -> String {
+  let mut link_open_count = 0usize;
+  let mut out = String::with_capacity(markdown.len());
+
+  for ch in markdown.chars() {
+    match ch {
+      '[' => {
+        link_open_count += 1;
+      }
+      ']' => {
+        link_open_count = link_open_count.saturating_sub(1);
+      }
+      _ => {}
+    }
+
+    let inside_link_content = link_open_count > 0;
+    if inside_link_content && ch == '\n' {
+      out.push('\\');
+      out.push('\n');
+    } else {
+      out.push(ch);
+    }
+  }
+
+  remove_skip_to_content_links(&out)
+}
+
+/// Process multi-line links in markdown.
+#[napi]
+pub async fn post_process_markdown(markdown: String) -> napi::Result<String> {
+  let res = task::spawn_blocking(move || post_process_markdown_text(&markdown))
+    .await
+    .map_err(|e| {
+      napi::Error::new(
+        napi::Status::GenericFailure,
+        format!("post_process_markdown join error: {e}"),
+      )
+    })?;
+
+  Ok(res)
+}
+
+fn remove_skip_to_content_links(input: &str) -> String {
+  const LABEL: &str = "Skip to Content";
+  let bytes = input.as_bytes();
+  let len = bytes.len();
+  let mut out = String::with_capacity(len);
+  let mut i = 0;
+
+  'outer: while i < len {
+    if bytes[i] == b'[' {
+      let label_start = i + 1;
+      let label_end = label_start + LABEL.len();
+
+      if label_end <= len && bytes[label_start..label_end].iter().all(|b| b.is_ascii()) {
+        let label_slice = &input[label_start..label_end];
+
+        if label_slice.eq_ignore_ascii_case(LABEL)
+          && label_end + 3 <= len
+          && bytes[label_end] == b']'
+          && bytes[label_end + 1] == b'('
+          && bytes[label_end + 2] == b'#'
+        {
+          let mut j = label_end + 3;
+
+          while j < len {
+            let ch = input[j..].chars().next().unwrap();
+            if ch == ')' {
+              i = j + ch.len_utf8();
+              continue 'outer;
+            }
+            j += ch.len_utf8();
+          }
+        }
+      }
+    }
+
+    let ch = input[i..].chars().next().unwrap();
+    out.push(ch);
+    i += ch.len_utf8();
+  }
+
+  out
 }

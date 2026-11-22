@@ -1,5 +1,7 @@
 import * as winston from "winston";
 
+import { config } from "../config";
+import { processRole } from "../service/service";
 import { configDotenv } from "dotenv";
 configDotenv();
 
@@ -35,19 +37,11 @@ const zeroDataRetentionFilter = winston.format(info => {
   return info;
 })();
 
-const reduceNoiseFilter = winston.format(info => {
-  if (
-    (info.metadata?.module === "nuq/metrics" ||
-      info.module === "nuq/metrics") &&
-    process.env.NUQ_REDUCE_NOISE === "true"
-  ) {
-    return false; // Don't log this message
-  }
-  return info;
-})();
+/** The role this process was started as, or the file it was started from. */
+const startedAs = processRole() ?? process.argv[1];
 
 export const logger = winston.createLogger({
-  level: process.env.LOGGING_LEVEL?.toLowerCase() ?? "debug",
+  level: config.LOGGING_LEVEL?.toLowerCase() ?? "debug",
   format: winston.format.json({
     replacer(key, value) {
       if (value instanceof Error) {
@@ -64,33 +58,33 @@ export const logger = winston.createLogger({
     },
   }),
   transports: [
-    ...(process.env.FIRECRAWL_LOG_TO_FILE
+    ...(config.FIRECRAWL_LOG_TO_FILE
       ? [
           new winston.transports.File({
             filename:
               "firecrawl-" +
-              (process.argv[1].includes("worker") ? "worker" : "app") +
-              "-" +
-              crypto.randomUUID() +
+              (startedAs.includes("worker") ? "worker" : "app") +
               ".log",
             format: winston.format.combine(
               zeroDataRetentionFilter,
               winston.format.json(),
             ),
+            maxsize: 10 * 1024 * 1024,
+            maxFiles: 3,
+            tailable: true,
           }),
         ]
       : []),
     new winston.transports.Console({
       format: winston.format.combine(
-        reduceNoiseFilter,
         zeroDataRetentionFilter,
         winston.format.timestamp({ format: "YYYY-MM-DD HH:mm:ss" }),
         winston.format.metadata({
           fillExcept: ["message", "level", "timestamp"],
         }),
-        ...((process.env.ENV === "production" &&
-          process.env.SENTRY_ENVIRONMENT === "dev") ||
-        process.env.ENV !== "production"
+        ...((config.ENV === "production" &&
+          config.SENTRY_ENVIRONMENT === "dev") ||
+        config.ENV !== "production"
           ? [winston.format.colorize(), logFormat]
           : []),
       ),
