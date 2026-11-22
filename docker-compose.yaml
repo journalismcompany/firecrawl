@@ -115,6 +115,9 @@ services:
       nuq-postgres:
         condition: service_healthy
         required: false
+      nuq-postgres-init:
+        condition: service_completed_successfully
+        required: false
     ports:
       - "${PORT:-3002}:${INTERNAL_PORT:-3002}"
     volumes:
@@ -188,6 +191,33 @@ services:
         max-size: "10m"
         max-file: "3"
         compress: "true"
+
+  nuq-postgres-init:
+    build: apps/nuq-postgres
+    depends_on:
+      nuq-postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      PGUSER: ${POSTGRES_USER:-postgres}
+      PGDATABASE: ${POSTGRES_DB:-postgres}
+      PGHOST: nuq-postgres
+    entrypoint:
+      - /bin/bash
+      - -ec
+      - |
+        printf '%s\n' \
+          'ALTER TABLE IF EXISTS nuq.queue_scrape' \
+          '  ADD COLUMN IF NOT EXISTS listen_channel_id text,' \
+          '  ADD COLUMN IF NOT EXISTS returnvalue jsonb,' \
+          '  ADD COLUMN IF NOT EXISTS failedreason text,' \
+          '  ADD COLUMN IF NOT EXISTS owner_id uuid,' \
+          '  ADD COLUMN IF NOT EXISTS group_id uuid;' \
+          | psql -v ON_ERROR_STOP=1
+        psql -v ON_ERROR_STOP=1 -f /docker-entrypoint-initdb.d/010-nuq.sql
+    networks:
+      - backend
+    restart: "no"
 
   # FoundationDB queue backend (experimental). Enable by setting
   # NUQ_BACKEND=fdb; the api container reads the shared cluster file from the
